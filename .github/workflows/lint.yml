@@ -1,0 +1,28 @@
+name: Lint
+
+on: push
+
+jobs:
+  lint:
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements_dev.txt
+
+      - name: Install the library
+        run: python -m pip install .
+
+      - name: Run Ruff
+        run: ruff check piburn tests
+
+      - name: Run mypy
+        run: mypy

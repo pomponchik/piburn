@@ -1,0 +1,65 @@
+[build-system]
+requires = ["setuptools==68.0.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "piburn"
+version = "0.1.0"
+authors = [{ name = "Evgeniy Blinov", email = "zheni-b@yandex.ru" }]
+description = "Flash ready-to-boot Ubuntu Server microSD cards for Raspberry Pi clusters"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { file = "LICENSE" }
+dependencies = []
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS :: MacOS X",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: System :: Installation/Setup",
+    "Typing :: Typed",
+]
+keywords = ["raspberry-pi", "ubuntu", "microSD", "cloud-init", "ansible"]
+
+[project.scripts]
+piburn = "piburn.cli:entrypoint"
+
+[project.urls]
+Source = "https://github.com/pomponchik/piburn"
+Tracker = "https://github.com/pomponchik/piburn/issues"
+
+[tool.setuptools.package-data]
+piburn = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--strict-markers"
+
+[tool.coverage.run]
+branch = true
+source = ["piburn"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+
+[tool.ruff]
+target-version = "py38"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+
+[tool.mypy]
+python_version = "3.8"
+strict = true
+packages = ["piburn"]
