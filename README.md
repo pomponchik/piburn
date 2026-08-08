@@ -9,7 +9,8 @@
 
 </details>
 
-# piburn
+![logo](https://raw.githubusercontent.com/pomponchik/piburn/develop/docs/assets/logo_1.svg)
+
 
 `piburn` turns removable microSD cards into ready-to-boot Ubuntu Server nodes for a Raspberry Pi cluster. It downloads and verifies the latest stable Raspberry Pi image, writes cloud-init configuration, safely ejects each card, and optionally generates an Ansible inventory.
 
@@ -18,30 +19,25 @@ The tool is intentionally conservative: it only offers physical, writable, remov
 
 ## Table of Contents
 
-- [Installation](#installation)
-- [Quick start](#quick-start)
-- [What gets configured](#what-gets-configured)
-- [Login methods](#login-methods)
-- [Card integrity test](#card-integrity-test)
-- [Non-interactive usage](#non-interactive-usage)
-- [Development](#development)
+- [**Installation**](#installation)
+- [**Quick start**](#quick-start)
+- [**What gets configured**](#what-gets-configured)
+- [**Login methods**](#login-methods)
+- [**Card integrity test**](#card-integrity-test)
+- [**Non-interactive usage**](#non-interactive-usage)
 
 
 ## Installation
 
 `piburn` requires macOS and Python 3.8 or newer. It has no third-party runtime dependencies.
 
-Clone the repository and install it into a local virtual environment:
+Install it:
 
 ```bash
-git clone https://github.com/pomponchik/piburn.git
-cd piburn
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install .
+pip install piburn
 ```
 
-The `piburn` command is now available inside the virtual environment:
+The `piburn` command is now available:
 
 ```bash
 piburn --help
@@ -141,16 +137,3 @@ Then replace `--auth-mode ssh-key` in the command with
 password variables after the run.
 
 Run `piburn --help` for every available option.
-
-
-## Development
-
-Development dependencies also belong in a local virtual environment:
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install -r requirements_dev.txt
-python -m pip install -e .
-pytest
-```
