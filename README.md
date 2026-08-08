@@ -31,17 +31,13 @@ The tool is intentionally conservative: it only offers physical, writable, remov
 
 `piburn` requires macOS and Python 3.8 or newer. It has no third-party runtime dependencies.
 
-Clone the repository and install it into a local virtual environment:
+Install it:
 
 ```bash
-git clone https://github.com/pomponchik/piburn.git
-cd piburn
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install .
+pip install piburn
 ```
 
-The `piburn` command is now available inside the virtual environment:
+The `piburn` command is now available:
 
 ```bash
 piburn --help
