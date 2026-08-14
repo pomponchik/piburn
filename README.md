@@ -52,7 +52,7 @@ Insert a microSD card and run:
 piburn
 ```
 
-The interactive interface asks for the number of cards, Wi-Fi credentials, hostname prefix, login method, and target device. Cards are prepared one at a time, so a single card reader is enough.
+The interactive interface asks for the number of cards, Wi-Fi credentials, hostname prefix, starting hostname number, login method, and target device. The starting number defaults to `1`. Cards are prepared one at a time, so a single card reader is enough.
 
 At the end, the tool can replace `ansible/inventory.ini` and prints one ready-to-use command per node:
 
@@ -114,6 +114,7 @@ piburn \
   --ssid MyNetwork \
   --wifi-password-env PIBURN_WIFI_PASSWORD \
   --prefix pi \
+  --start-number 1 \
   --auth-mode ssh-key \
   --device /dev/disk4 \
   --device /dev/disk5 \

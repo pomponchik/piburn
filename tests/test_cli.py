@@ -216,6 +216,12 @@ def test_generated_password_contains_only_letters_and_digits():
     assert re.search(r"^[A-Za-z0-9]+$", password)
 
 
+def test_positive_int_prompt_accepts_default_and_retries_invalid_input(capsys):
+    with mock.patch.object(burn, "input", side_effect=["zero", "0", ""]):
+        assert burn.ask_positive_int("Starting hostname number [1]: ", default=1) == 1
+    assert capsys.readouterr().err.count("Error: enter a positive integer") == 2
+
+
 def test_inventory_is_replaced():
     with tempfile.TemporaryDirectory() as directory:
         path = Path(directory) / "ansible" / "inventory.ini"
@@ -377,6 +383,7 @@ def test_noninteractive_validation():
         ssid="wifi",
         wifi_password_env="WIFI",
         prefix="pi",
+        start_number=1,
         device=["/dev/disk4"],
         inventory=False,
         yes=True,
@@ -399,6 +406,61 @@ def test_noninteractive_validation():
 def test_image_cache_option_is_not_exposed():
     args = burn.parse_args([])
     assert not hasattr(args, "cache_dir")
+
+
+@pytest.mark.parametrize("value", [0, -1])
+def test_start_number_must_be_positive(value):
+    args = burn.parse_args(["--start-number", str(value)])
+    with pytest.raises(burn.BurnError, match="--start-number must be a positive integer"):
+        burn.validate_args(args)
+
+
+def test_interactive_start_number_prompt_follows_prefix_and_defaults_to_one():
+    disk = burn.Disk("disk4", "SD Card", 32 * 1024**3, "USB", False, True, True)
+    image = burn.ImageSpec(Path("ubuntu.img"), None, "test image", uncompressed_size=1024)
+
+    with mock.patch.dict(burn.os.environ, {"WIFI": "secret"}), mock.patch.object(
+        burn, "input", side_effect=["node", "invalid", ""]
+    ) as prompt, mock.patch.object(
+        burn, "find_ssh_public_key", return_value=("ssh-ed25519 AAAA test", None)
+    ), mock.patch.object(
+        burn, "resolve_image", return_value=image
+    ), mock.patch.object(
+        burn, "ensure_sudo"
+    ), mock.patch.object(
+        burn, "get_disk", return_value=disk
+    ), mock.patch.object(
+        burn, "write_image", return_value=("b" * 64, 1024)
+    ), mock.patch.object(
+        burn, "write_cloud_init"
+    ) as cloud_init, mock.patch.object(
+        burn, "eject_disk"
+    ):
+        result = burn.main(
+            [
+                "--count",
+                "1",
+                "--no-check",
+                "--ssid",
+                "wifi",
+                "--wifi-password-env",
+                "WIFI",
+                "--auth-mode",
+                "ssh-key",
+                "--device",
+                "/dev/disk4",
+                "--no-inventory",
+                "--yes",
+            ]
+        )
+
+    assert result == 0
+    assert prompt.call_args_list == [
+        mock.call("Hostname prefix [pi]: "),
+        mock.call("Starting hostname number [1]: "),
+        mock.call("Starting hostname number [1]: "),
+    ]
+    assert cloud_init.call_args.args[1] == "node-1"
 
 
 def test_noninteractive_flow_can_reuse_same_card_reader():
@@ -436,6 +498,8 @@ def test_noninteractive_flow_can_reuse_same_card_reader():
                 "WIFI",
                 "--prefix",
                 "pi",
+                "--start-number",
+                "5",
                 "--auth-mode",
                 "ssh-key",
                 "--device",
@@ -450,12 +514,12 @@ def test_noninteractive_flow_can_reuse_same_card_reader():
         )
         assert result == 0
         assert cloud_init.call_count == 2
-        assert "pi-1.local" in inventory.read_text()
-        assert "pi-2.local" in inventory.read_text()
+        assert "pi-5.local" in inventory.read_text()
+        assert "pi-6.local" in inventory.read_text()
         assert "ansible_user=pomponchik" in inventory.read_text()
     assert len(downloaded_paths) == 1
     assert not downloaded_paths[0].exists()
-    assert "SSH commands:\nssh pomponchik@pi-1.local\nssh pomponchik@pi-2.local\n" in output.getvalue()
+    assert "SSH commands:\nssh pomponchik@pi-5.local\nssh pomponchik@pi-6.local\n" in output.getvalue()
 
 
 def test_forced_device_waits_for_next_card():

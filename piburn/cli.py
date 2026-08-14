@@ -309,10 +309,13 @@ def ensure_same_disk(original: Disk) -> Disk:
     return current
 
 
-def ask_positive_int(prompt: str) -> int:
+def ask_positive_int(prompt: str, default: Optional[int] = None) -> int:
     while True:
+        answer = input(prompt).strip()
+        if not answer and default is not None:
+            return default
         try:
-            value = int(input(prompt).strip())
+            value = int(answer)
             if value > 0:
                 return value
         except ValueError:
@@ -1465,6 +1468,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="read the Wi-Fi password from environment variable VAR (do not pass passwords in argv)",
     )
     parser.add_argument("--prefix", help="hostname prefix; defaults to pi")
+    parser.add_argument(
+        "--start-number",
+        type=int,
+        help="number of the first hostname; defaults to 1",
+    )
     parser.add_argument("--username", default="pomponchik", help="Linux username (pomponchik)")
     parser.add_argument(
         "--auth-mode",
@@ -1510,6 +1518,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 def validate_args(args: argparse.Namespace) -> None:
     if args.count is not None and args.count <= 0:
         raise BurnError("--count must be a positive integer")
+    if args.start_number is not None and args.start_number <= 0:
+        raise BurnError("--start-number must be a positive integer")
     if args.device and args.count is not None and len(args.device) != args.count:
         raise BurnError("The number of --device options must match --count")
     for device in args.device:
@@ -1636,6 +1646,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if prefix is None:
         prefix = input("Hostname prefix [pi]: ").strip() or "pi"
     prefix = validate_prefix(prefix)
+    start_number = args.start_number
+    if start_number is None:
+        start_number = 1 if args.non_interactive else ask_positive_int("Starting hostname number [1]: ", default=1)
     username = validate_username(args.username)
     timezone = args.timezone or detect_timezone()
 
@@ -1690,10 +1703,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
         current_disk = None  # type: Optional[Disk]
         try:
-            for index in range(1, count + 1):
-                hostname = hostname_for(prefix, index)
-                print("\nCard {}/{} → {}.local".format(index, count, hostname))
-                forced_device = args.device[index - 1] if args.device else None
+            for card_number in range(1, count + 1):
+                hostname = hostname_for(prefix, start_number + card_number - 1)
+                print("\nCard {}/{} → {}.local".format(card_number, count, hostname))
+                forced_device = args.device[card_number - 1] if args.device else None
                 while True:
                     if forced_device:
                         current_disk = wait_for_disk(forced_device)
