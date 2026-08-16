@@ -31,7 +31,7 @@
      inkscape:window-width="2672"
      inkscape:window-height="1183"
      inkscape:window-x="166"
-     inkscape:window-y="65"
+     inkscape:window-y="37"
      inkscape:window-maximized="0"
      inkscape:current-layer="svg8" />
   <title
@@ -44,20 +44,23 @@
      transform="matrix(0.16981132,0,0,-0.16505376,4.64,282.47)"
      d="m 750,-294 v 173 c -167,0 -211,67 -211,232 v 269 c 0,107 -38,207 -188,256 150,48 188,147 188,254 v 271 c 0,165 44,232 211,232 v 173 C 462,1566 334,1465 334,1171 V 956 C 334,810 285,746 145,739 H 114 V 533 h 31 C 285,525 334,461 334,315 V 101 c 0,-295 128,-395 416,-395 z"
      id="path1"
-     sodipodi:nodetypes="ccsscssccssccccssc" />
+     sodipodi:nodetypes="ccsscssccssccccssc"
+     style="fill:#8b8b8b;fill-opacity:1" />
   <path
      aria-label="p"
      fill="#181818"
      transform="matrix(0.16197183,0,0,-0.145,211.72,269)"
      d="m 119,-418 h 211 v 577 h 3 C 404,38 517,-21 655,-21 c 275,0 458,222 458,549 0,326 -184,549 -457,549 -137,0 -260,-57 -327,-173 h -3 v 152 H 119 Z M 612,161 C 432,161 316,306 316,528 316,750 432,896 612,896 782,896 899,767 899,528 899,290 782,161 612,161 Z"
      id="path2"
-     sodipodi:nodetypes="ccccssscccccsssss" />
+     sodipodi:nodetypes="ccccssscccccsssss"
+     style="fill:#8c8c8c;fill-opacity:1" />
   <path
      aria-label="i"
      fill="#181818"
      transform="matrix(0.1760299625 0 0 -0.1450000000 402.9800 269.0000)"
      d="M119 0H330V1056H119ZM224 1238C299 1238 358 1295 358 1367C358 1440 299 1497 224 1497C149 1497 91 1440 91 1367C91 1295 149 1238 224 1238Z"
-     id="path3" />
+     id="path3"
+     style="fill:#8c8c8c;fill-opacity:1" />
   <path
      aria-label="b"
      fill="#f93348"
@@ -91,5 +94,6 @@
      fill="#181818"
      transform="matrix(0.1685039370 0 0 -0.1650537634 1195.1900 282.4700)"
      d="M76 -294C363 -294 491 -194 491 101V315C491 471 548 533 711 534V738H706C546 739 491 801 491 956V1171C491 1465 363 1566 76 1566V1393C242 1393 287 1326 287 1161V890C287 783 324 684 474 636C324 587 287 487 287 380V111C287 -54 242 -121 76 -121Z"
-     id="path8" />
+     id="path8"
+     style="fill:#8c8c8c;fill-opacity:1" />
 </svg>
