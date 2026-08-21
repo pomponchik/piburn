@@ -61,6 +61,5 @@ line-length = 120
 select = ["E", "F", "I", "W"]
 
 [tool.mypy]
-python_version = "3.8"
 strict = true
 packages = ["piburn"]
