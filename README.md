@@ -74,15 +74,15 @@ Insert each ejected card into a Raspberry Pi and power it on. Use the correspond
 
 Every card receives:
 
-- an OS image—by default, the latest published stable Ubuntu Server ARM64 release for Raspberry Pi;
+- the selected OS image;
 - a unique hostname such as `pi-1`, reachable on the local network as `pi-1.local`;
 - the `pomponchik` user by default, configurable with `--username`;
-- Wi-Fi and Ethernet configured to obtain network settings automatically, without delaying boot when no Ethernet cable is connected;
+- Wi-Fi and Ethernet configured to obtain network settings automatically;
 - either an SSH public key or a shared login password;
 - Avahi for `.local` name discovery;
 - cloud-init configuration that expands Ubuntu to use the card's full capacity on first boot.
 
-Remote images are downloaded into a temporary directory and removed after success, failure, or `Ctrl+C`. They are never kept in a persistent cache. A local file supplied through `--image` is never deleted.
+Downloaded images are temporary; local files supplied through `--image` are left untouched.
 
 
 ## Login methods
@@ -93,9 +93,9 @@ For SSH-key login, `piburn` looks for an existing SSH public key in common `~/.s
 ssh-keygen -t ed25519
 ```
 
-Alternatively, choose password login. `piburn` displays a random 20-character alphanumeric password; press Enter to accept it or type your own, and save whichever password you use. Only its SHA-512 crypt hash, not the plaintext password, is written to the card's cloud-init configuration.
+Alternatively, choose password login. `piburn` displays a random password; press Enter to accept it or type your own, and save whichever password you use. Only its hash is written to the card.
 
-In interactive mode, the Wi-Fi password is hidden while you type, and `piburn` does not save a persistent copy on the Mac. It is still written to the card's `network-config` so the Raspberry Pi can join the network.
+In interactive mode, the Wi-Fi password is hidden while you type, and `piburn` does not save a persistent copy on the Mac. It must still be written to the card so the Raspberry Pi can join the network.
 
 
 ## Card integrity test
@@ -141,5 +141,3 @@ export PIBURN_USER_PASSWORD='node-password'
 Also replace `--auth-mode ssh-key` in the command with
 `--auth-mode password --user-password-env PIBURN_USER_PASSWORD`. Unset both
 password variables after the run.
-
-Run `piburn --help` to see all available options.
