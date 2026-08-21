@@ -1,18 +1,26 @@
 <details>
   <summary>ⓘ</summary>
 
+[![Downloads](https://static.pepy.tech/badge/piburn/month)](https://pepy.tech/project/piburn)
+[![Downloads](https://static.pepy.tech/badge/piburn)](https://pepy.tech/project/piburn)
+[![Coverage Status](https://coveralls.io/repos/github/pomponchik/piburn/badge.svg?branch=main)](https://coveralls.io/github/pomponchik/piburn?branch=main)
+[![Lines of code](https://sloc.xyz/github/pomponchik/piburn/?category=code)](https://github.com/boyter/scc/)
+[![Hits-of-Code](https://hitsofcode.com/github/pomponchik/piburn?branch=main)](https://hitsofcode.com/github/pomponchik/piburn/view?branch=main)
 [![Tests](https://github.com/pomponchik/piburn/actions/workflows/tests_and_coverage.yml/badge.svg)](https://github.com/pomponchik/piburn/actions/workflows/tests_and_coverage.yml)
 [![Lint](https://github.com/pomponchik/piburn/actions/workflows/lint.yml/badge.svg)](https://github.com/pomponchik/piburn/actions/workflows/lint.yml)
 [![Python versions](https://img.shields.io/pypi/pyversions/piburn.svg)](https://pypi.org/project/piburn/)
+[![PyPI version](https://badge.fury.io/py/piburn.svg)](https://badge.fury.io/py/piburn)
+[![Checked with mypy](https://www.mypy-lang.org/static/mypy_badge.svg)](https://mypy-lang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
+[![DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/pomponchik/piburn)
 
 </details>
 
 ![logo](https://raw.githubusercontent.com/pomponchik/piburn/develop/docs/assets/logo_1.svg)
 
 
-`piburn` prepares removable microSD cards that boot Raspberry Pis as Ubuntu Server cluster nodes. It downloads and verifies the latest stable Ubuntu Server image for Raspberry Pi, writes settings that Ubuntu applies on first boot through cloud-init, safely ejects each card, and can generate an Ansible inventory (a list of nodes to manage).
+`piburn` prepares removable microSD cards that boot Raspberry Pis as Ubuntu Server cluster nodes. It downloads and verifies the latest stable [Ubuntu Server image for Raspberry Pi](https://ubuntu.com/download/raspberry-pi), writes settings that Ubuntu applies on first boot through [cloud-init](https://docs.cloud-init.io/en/latest/), safely ejects each card, and can generate an Ansible inventory (a list of nodes to manage).
 
 The tool is intentionally conservative: it only lets you select physical, writable, removable media of at least 4 GiB and verifies that the selected device has not changed before erasing or writing to it.
 
@@ -32,7 +40,7 @@ The tool is intentionally conservative: it only lets you select physical, writab
 `piburn` requires macOS and Python 3.8 or newer. It has no third-party runtime dependencies.
 Writing to a card requires macOS administrator privileges.
 
-Install it:
+Install it from [PyPI](https://pypi.org/project/piburn/):
 
 ```bash
 pip install piburn
@@ -59,7 +67,7 @@ The interactive interface first asks how many cards to prepare and whether to ru
 
 Press `Ctrl+C` at any step to stop.
 
-After the last card, the tool asks whether to generate an Ansible inventory. If you accept, it creates or replaces `ansible/inventory.ini` by default; this file lists the nodes managed by Ansible. It then prints one SSH command per node:
+After the last card, the tool asks whether to generate an [Ansible inventory](https://docs.ansible.com/projects/ansible/latest/inventory_guide/intro_inventory.html). If you accept, it creates or replaces `ansible/inventory.ini` by default; this file lists the nodes managed by Ansible. It then prints one SSH command per node:
 
 ```text
 SSH commands:
@@ -79,7 +87,7 @@ Every card receives:
 - the `pomponchik` user by default, configurable with `--username`;
 - Wi-Fi and Ethernet configured to obtain network settings automatically;
 - either an SSH public key or a shared login password;
-- Avahi for `.local` name discovery;
+- [Avahi](https://avahi.org/) for `.local` name discovery;
 - cloud-init configuration that expands Ubuntu to use the card's full capacity on first boot.
 
 Downloaded images are temporary; local files supplied through `--image` are left untouched.
