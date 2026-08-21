@@ -20,9 +20,9 @@
 ![logo](https://raw.githubusercontent.com/pomponchik/piburn/develop/docs/assets/logo_1.svg)
 
 
-`piburn` prepares removable microSD cards that boot Raspberry Pis as Ubuntu Server cluster nodes. It downloads and verifies the latest stable [Ubuntu Server image for Raspberry Pi](https://ubuntu.com/download/raspberry-pi), writes settings that Ubuntu applies on first boot through [cloud-init](https://docs.cloud-init.io/en/latest/), safely ejects each card, and can generate an Ansible inventory (a list of nodes to manage).
+`piburn` prepares removable microSD cards that boot Raspberry Pis with Ubuntu Server for use as cluster nodes. By default, it downloads the latest stable [Ubuntu Server image for Raspberry Pi](https://ubuntu.com/download/raspberry-pi) and verifies its published SHA-256 checksum. It writes settings that Ubuntu applies on first boot through [cloud-init](https://docs.cloud-init.io/en/latest/), safely ejects each card, and can generate an Ansible inventory (a list of nodes to manage).
 
-The tool is intentionally conservative: it only lets you select physical, writable, removable media of at least 4 GiB and verifies that the selected device has not changed before erasing or writing to it.
+The tool is intentionally conservative: it only lets you select physical, writable, removable media of at least 4 GiB and rechecks the selected device's identifying attributes before erasing or writing to it.
 
 
 ## Table of Contents
@@ -55,7 +55,7 @@ piburn --help
 
 ## Quick start
 
-> **Warning:** flashing and integrity testing erase the selected card completely. Always verify the device name, model, and capacity before confirming it.
+> **Warning:** flashing and integrity testing can destroy existing data on the selected card. Integrity testing overwrites its entire reported capacity. Always verify the device name, model, and capacity before confirming it.
 
 Insert a microSD card and run:
 
@@ -83,11 +83,11 @@ Insert each ejected card into a Raspberry Pi and power it on. Use the correspond
 Every card receives:
 
 - the selected OS image;
-- a unique hostname such as `pi-1`, reachable on the local network as `pi-1.local`;
+- a numbered hostname such as `pi-1`;
 - the `pomponchik` user by default, configurable with `--username`;
 - Wi-Fi and Ethernet configured to obtain network settings automatically;
 - either an SSH public key or a shared login password;
-- [Avahi](https://avahi.org/) for `.local` name discovery;
+- [Avahi](https://avahi.org/) for discovery of `.local` names such as `pi-1.local`;
 - cloud-init configuration that expands Ubuntu to use the card's full capacity on first boot.
 
 Downloaded images are temporary; local files supplied through `--image` are left untouched.
@@ -113,7 +113,7 @@ The optional full integrity test writes test data across the card's entire repor
 
 ## Non-interactive usage
 
-Passwords are read from environment variables rather than command-line arguments. Replace `wifi-password`, `MyNetwork`, and the sample device paths with your own values; `--yes` explicitly authorizes erasing those devices.
+`--non-interactive` disables `piburn`'s own prompts, but `sudo` may still request administrator authentication. Passwords are read from environment variables rather than command-line arguments. Replace `wifi-password`, `MyNetwork`, and the sample device paths with your own values; `--yes` authorizes writing to those devices without confirmation.
 
 ```bash
 export PIBURN_WIFI_PASSWORD='wifi-password'
@@ -122,7 +122,7 @@ piburn \
   --non-interactive \
   --count 2 \
   --no-check \
-  --ssid MyNetwork \
+  --ssid 'MyNetwork' \
   --wifi-password-env PIBURN_WIFI_PASSWORD \
   --prefix pi \
   --start-number 1 \
