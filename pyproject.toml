@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "piburn"
-version = "0.0.4"
+version = "0.0.5"
 authors = [{ name = "Evgeniy Blinov", email = "zheni-b@yandex.ru" }]
 description = "Flash ready-to-boot Ubuntu Server microSD cards for Raspberry Pi clusters"
 readme = "README.md"
