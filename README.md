@@ -113,7 +113,7 @@ The optional full integrity test writes test data across the card's entire repor
 
 ## Non-interactive usage
 
-`--non-interactive` disables `piburn`'s own prompts, but `sudo` may still request administrator authentication. Passwords are read from environment variables rather than command-line arguments. Replace `wifi-password`, `MyNetwork`, and the sample device paths with your own values; `--yes` authorizes writing to those devices without confirmation.
+`--non-interactive` disables `piburn`'s own prompts, but `sudo` may still request administrator authentication once at the start. `piburn` keeps that authorization active during long writes and checks; macOS may ask again only if the authorization is revoked or the system uses an unusually short timeout. Passwords are read from environment variables rather than command-line arguments. Replace `wifi-password`, `MyNetwork`, and the sample device paths with your own values; `--yes` authorizes writing to those devices without confirmation.
 
 ```bash
 export PIBURN_WIFI_PASSWORD='wifi-password'
