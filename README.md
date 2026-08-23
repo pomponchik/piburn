@@ -108,7 +108,17 @@ In interactive mode, the Wi-Fi password is hidden while you type, and `piburn` d
 
 ## Card integrity test
 
-The optional full integrity test writes test data across the card's entire reported capacity and reads it back. This can detect corrupted or counterfeit media, but it is destructive and may take longer than flashing Ubuntu itself.
+The optional full integrity test writes a newly randomized, position-dependent pattern across the card's entire reported capacity and reads it back without using the local read cache. This can detect corrupted or counterfeit media, including stale data from an earlier test, but it is destructive and may take longer than flashing Ubuntu itself.
+
+After Ubuntu is written, `piburn` performs a separate byte-for-byte comparison between the card and a freshly verified and decompressed source image. The full-card test and this post-flash verification cover different write operations: passing the first does not guarantee that a later image write cannot fail. Writes request an explicit `fsync`, and verification reads bypass the macOS cache. If data differs, `piburn` reports the first differing byte, full and per-block SHA-256 values, and whether repeated direct reads are stable, transient, or inconsistent. Any inconsistent read remains an error.
+
+Downloaded images are normally removed after the run, including after automatic mismatch diagnostics. To retain the downloaded image and a secret-free diagnostic report after a failure, pass a destination directory:
+
+```bash
+piburn --keep-image-on-failure ./piburn-diagnostics
+```
+
+For a remote image, `piburn` stages the temporary download on the destination filesystem so it can be preserved by an atomic rename without creating another multi-gigabyte copy. A successful run removes that staging directory without creating a failure subdirectory. After a failed or cancelled run, `piburn` creates a unique subdirectory and prints the resulting paths. A local image is not duplicated; the report refers to its existing path. Failure to preserve these artifacts is reported separately and never replaces the original write or verification error.
 
 
 ## Non-interactive usage
