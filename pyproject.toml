@@ -44,6 +44,7 @@ piburn = ["py.typed"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "--strict-markers"
+pythonpath = ["."]
 
 [tool.coverage.run]
 branch = true
