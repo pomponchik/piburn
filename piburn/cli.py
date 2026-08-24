@@ -43,6 +43,7 @@ IMAGE_PATTERN = re.compile(r"ubuntu-[\w.]+-preinstalled-server-arm64\+raspi\.img
 MIN_CARD_SIZE = 4 * 1024**3
 CHUNK_SIZE = 4 * 1024**2
 INTEGRITY_PATTERN_BLOCK_SIZE = CHUNK_SIZE
+SUDO_REFRESH_INTERVAL = 60.0
 USER_AGENT = "cluster-burn/1.0"
 PASSWORD_ALPHABET = string.ascii_letters + string.digits
 CRYPT_ALPHABET = "./0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
@@ -50,6 +51,10 @@ CRYPT_ALPHABET = "./0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwx
 
 class BurnError(RuntimeError):
     """An expected, user-facing failure."""
+
+
+class SudoError(BurnError):
+    """Administrator authorization could not be obtained or refreshed."""
 
 
 class FetchError(BurnError):
@@ -110,6 +115,36 @@ class ImageSpec:
     source: str
     uncompressed_size: Optional[int] = None
     file_identity: Optional[Tuple[int, int, int, int]] = None
+
+
+class SudoSession:
+    """Keep one sudo authentication valid during a long card-writing run."""
+
+    def __init__(self, refresh_interval: float = SUDO_REFRESH_INTERVAL) -> None:
+        self.refresh_interval = refresh_interval
+        self.next_refresh = 0.0
+
+    def authenticate(self) -> None:
+        try:
+            run(["sudo", "-v"], capture=False)
+        except BurnError as exc:
+            raise SudoError(str(exc)) from exc
+        self.next_refresh = time.monotonic() + self.refresh_interval
+
+    def keep_alive(self) -> None:
+        if time.monotonic() < self.next_refresh:
+            return
+        try:
+            result = run(["sudo", "-n", "-v"], check=False)
+        except BurnError as exc:
+            raise SudoError(str(exc)) from exc
+        if result.returncode != 0:
+            print("Administrator authorization expired; macOS will ask for the password again.")
+            try:
+                run(["sudo", "-v"], capture=False)
+            except BurnError as exc:
+                raise SudoError(str(exc)) from exc
+        self.next_refresh = time.monotonic() + self.refresh_interval
 
 
 class TerminalInputParser:
@@ -383,6 +418,7 @@ def choose_dynamic(
     provider: Callable[[], Sequence[Tuple[str, str]]],
     allow_custom: bool = False,
     refresh_interval: float = 1.0,
+    heartbeat: Optional[Callable[[], None]] = None,
 ) -> str:
     """Arrow-key selector with live filtering and periodically refreshed choices."""
     if not sys.stdin.isatty() or not sys.stdout.isatty():
@@ -390,7 +426,11 @@ def choose_dynamic(
         for number, (_, label) in enumerate(fallback_options, 1):
             print("  {}) {}".format(number, label))
         while True:
+            if heartbeat is not None:
+                heartbeat()
             answer = input(prompt + (" (number or value): " if allow_custom else " (number): ")).strip()
+            if heartbeat is not None:
+                heartbeat()
             if allow_custom and answer and not answer.isdigit():
                 return answer
             if answer.isdigit() and 1 <= int(answer) <= len(fallback_options):
@@ -400,7 +440,9 @@ def choose_dynamic(
     query = ""
     selected = None  # type: Optional[int]
     options = []  # type: List[Tuple[str, str]]
-    last_refresh = 0.0
+    # Some platforms start their monotonic clock near zero. Use an explicit
+    # sentinel so the provider is always called before the first key event.
+    last_refresh = -float("inf")
     last_render = None  # type: object
     input_parser = TerminalInputParser()
     result = None  # type: Optional[str]
@@ -408,6 +450,8 @@ def choose_dynamic(
     print()
     with cbreak_terminal():
         while True:
+            if heartbeat is not None:
+                heartbeat()
             now = time.monotonic()
             if now - last_refresh >= refresh_interval:
                 previous_filtered = [item for item in options if query.lower() in item[1].lower()]
@@ -988,13 +1032,14 @@ def show_progress(label: str, done: int, total: int, started: Optional[float] = 
     sys.stdout.flush()
 
 
-def ensure_sudo() -> None:
-    print("macOS will ask for an administrator password to write directly to the card.")
-    refresh_sudo()
-
-
-def refresh_sudo() -> None:
-    run(["sudo", "-v"], capture=False)
+def ensure_sudo() -> SudoSession:
+    print(
+        "macOS will normally ask once for an administrator password; "
+        "it may ask again if authorization is revoked or expires unusually quickly."
+    )
+    session = SudoSession()
+    session.authenticate()
+    return session
 
 
 def popen_or_error(args: Sequence[str], **kwargs: Any) -> subprocess.Popen[bytes]:
@@ -1015,78 +1060,53 @@ def eject_disk(disk: Disk, quiet: bool = False) -> None:
         raise BurnError("Could not eject {}: {}".format(disk.device, detail))
 
 
-def read_stream_from_disk(disk: Disk, byte_limit: Optional[int], label: str) -> str:
-    # A full-card operation can outlive sudo's timestamp, so refresh it before
-    # every new privileged process rather than relying on the initial prompt.
-    refresh_sudo()
-    ensure_same_disk(disk)
-    count_args = []
-    if byte_limit is not None:
-        count_args = ["count={}".format((byte_limit + CHUNK_SIZE - 1) // CHUNK_SIZE)]
-    process = popen_or_error(
-        ["sudo", "-n", "dd", "if=" + disk.raw_device, "bs=" + str(CHUNK_SIZE)] + count_args,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        # Keep the controlling terminal so macOS sudo can reuse the ticket
-        # created by `sudo -v`. A separate process group still lets us stop
-        # sudo and dd together on Ctrl+C or an I/O failure.
-        preexec_fn=os.setpgrp,
-    )
-    digest = hashlib.sha256()
-    consumed = 0
-    started = time.monotonic()
-    try:
-        assert process.stdout is not None
-        while True:
-            chunk = process.stdout.read(CHUNK_SIZE)
-            if not chunk:
-                break
-            if byte_limit is not None:
-                chunk = chunk[: max(0, byte_limit - consumed)]
-            if chunk:
-                digest.update(chunk)
-                consumed += len(chunk)
-                show_progress(label, consumed, byte_limit or disk.size, started)
-        stderr = process.communicate()[1].decode("utf-8", "replace")
-    except (KeyboardInterrupt, OSError) as exc:
-        terminate_process_group(process)
-        process.wait()
-        if isinstance(exc, KeyboardInterrupt):
-            raise
-        raise BurnError("Could not read {}: {}".format(disk.device, exc))
-    print()
-    if process.returncode != 0:
-        raise BurnError("Could not read {}: {}".format(disk.device, stderr.strip()))
-    expected_size = byte_limit if byte_limit is not None else disk.size
-    if consumed != expected_size:
-        raise BurnError("Fewer bytes were read from the card than were written")
-    return digest.hexdigest()
+def write_all(stream: Any, data: bytes) -> None:
+    """Write a complete block to a pipe whose write method may make partial progress."""
+    remaining = memoryview(data)
+    while remaining:
+        written = stream.write(remaining)
+        if not isinstance(written, int) or written <= 0 or written > len(remaining):
+            raise OSError("the dd input pipe did not accept the complete block")
+        remaining = remaining[written:]
 
 
-def integrity_pattern(offset: int, length: int) -> bytes:
+def read_up_to(stream: Any, size: int) -> bytes:
+    """Read up to size bytes, joining short reads until EOF or the requested size."""
+    chunks = []
+    remaining = size
+    while remaining:
+        chunk = stream.read(remaining)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def integrity_pattern(seed: bytes, offset: int, length: int) -> bytes:
     result = bytearray()
     position = offset
     while len(result) < length:
         block_number = position // INTEGRITY_PATTERN_BLOCK_SIZE
         offset_in_block = position % INTEGRITY_PATTERN_BLOCK_SIZE
-        seed = b"cluster-burn-integrity-v1" + block_number.to_bytes(8, "big")
+        block_seed = b"piburn-integrity-v2\0" + seed + block_number.to_bytes(8, "big")
         # SHAKE produces a deterministic, non-periodic byte stream for the
         # whole chunk. Sector aliases within a chunk therefore cannot compare
         # equal merely because a short digest was repeated.
-        block = hashlib.shake_256(seed).digest(INTEGRITY_PATTERN_BLOCK_SIZE)
+        block = hashlib.shake_256(block_seed).digest(INTEGRITY_PATTERN_BLOCK_SIZE)
         take = min(length - len(result), INTEGRITY_PATTERN_BLOCK_SIZE - offset_in_block)
         result.extend(block[offset_in_block : offset_in_block + take])
         position += take
     return bytes(result)
 
 
-def write_integrity_pattern(disk: Disk) -> None:
-    refresh_sudo()
+def write_integrity_pattern(disk: Disk, sudo_session: SudoSession, seed: bytes) -> None:
+    sudo_session.keep_alive()
     ensure_same_disk(disk)
     unmount_disk(disk)
     ensure_same_disk(disk)
     process = popen_or_error(
-        ["sudo", "-n", "dd", "of=" + disk.raw_device, "bs=" + str(CHUNK_SIZE)],
+        ["sudo", "-n", "dd", "of=" + disk.raw_device, "bs=" + str(CHUNK_SIZE), "conv=fsync"],
         stdin=subprocess.PIPE,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
@@ -1098,17 +1118,32 @@ def write_integrity_pattern(disk: Disk) -> None:
         assert process.stdin is not None
         while written < disk.size:
             chunk_size = min(CHUNK_SIZE, disk.size - written)
-            process.stdin.write(integrity_pattern(written, chunk_size))
+            write_all(process.stdin, integrity_pattern(seed, written, chunk_size))
             written += chunk_size
             show_progress("Integrity test write", written, disk.size, started)
+            sudo_session.keep_alive()
         process.stdin.close()
         process.stdin = None
         stderr = process.communicate()[1].decode("utf-8", "replace")
-    except (KeyboardInterrupt, BrokenPipeError, OSError) as exc:
-        terminate_process_group(process)
-        process.wait()
+    except (KeyboardInterrupt, BurnError, BrokenPipeError, OSError) as exc:
+        close_process_stdin(process)
+        detail = ""
+        if isinstance(exc, BrokenPipeError):
+            # dd has already closed its input; let it finish so its stderr
+            # explains the underlying device failure.
+            detail = process_stderr(process)
+            if process.poll() is None:
+                terminate_process_group(process)
+        else:
+            terminate_process_group(process)
+            process.wait()
         if isinstance(exc, KeyboardInterrupt):
             raise
+        if isinstance(exc, BurnError):
+            raise
+        if isinstance(exc, BrokenPipeError):
+            suffix = detail or "dd closed its input pipe without an error message"
+            raise BurnError("Integrity test write failed for {}: {}".format(disk.device, suffix))
         raise BurnError("Integrity test write failed for {}: {}".format(disk.device, exc))
     print()
     if process.returncode != 0:
@@ -1116,11 +1151,18 @@ def write_integrity_pattern(disk: Disk) -> None:
     run(["sync"], capture=False)
 
 
-def verify_integrity_pattern(disk: Disk) -> None:
-    refresh_sudo()
+def verify_integrity_pattern(disk: Disk, sudo_session: SudoSession, seed: bytes) -> None:
+    sudo_session.keep_alive()
     ensure_same_disk(disk)
     process = popen_or_error(
-        ["sudo", "-n", "dd", "if=" + disk.raw_device, "bs=" + str(CHUNK_SIZE)],
+        [
+            "sudo",
+            "-n",
+            "dd",
+            "if=" + disk.raw_device,
+            "bs=" + str(CHUNK_SIZE),
+            "iflag=direct,fullblock",
+        ],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         preexec_fn=os.setpgrp,
@@ -1130,13 +1172,14 @@ def verify_integrity_pattern(disk: Disk) -> None:
     try:
         assert process.stdout is not None
         while True:
-            chunk = process.stdout.read(CHUNK_SIZE)
+            chunk = read_up_to(process.stdout, CHUNK_SIZE)
             if not chunk:
                 break
-            if chunk != integrity_pattern(consumed, len(chunk)):
+            if chunk != integrity_pattern(seed, consumed, len(chunk)):
                 raise BurnError("Integrity test data differs at offset {}".format(human_size(consumed)))
             consumed += len(chunk)
             show_progress("Integrity test read", consumed, disk.size, started)
+            sudo_session.keep_alive()
         stderr = process.communicate()[1].decode("utf-8", "replace")
     except (KeyboardInterrupt, BurnError, OSError) as exc:
         terminate_process_group(process)
@@ -1155,17 +1198,20 @@ def verify_integrity_pattern(disk: Disk) -> None:
         )
 
 
-def check_media(disk: Disk) -> bool:
+def check_media(disk: Disk, sudo_session: SudoSession) -> bool:
     print(
         "Full write/read integrity test for {} ({}). All data will be erased; this may take a long time.".format(
             disk.device, human_size(disk.size)
         )
     )
     try:
-        write_integrity_pattern(disk)
-        verify_integrity_pattern(disk)
+        seed = secrets.token_bytes(32)
+        write_integrity_pattern(disk, sudo_session, seed)
+        verify_integrity_pattern(disk, sudo_session, seed)
         print("The card passed the full write/read integrity test.")
         return True
+    except SudoError:
+        raise
     except BurnError as exc:
         eprint("The card failed the integrity test: {}".format(exc))
         return False
@@ -1205,7 +1251,7 @@ def verified_source_stream(image: ImageSpec) -> Iterator[Any]:
                     break
                 digest.update(chunk)
             if digest.hexdigest() != image.compressed_sha256.lower():
-                raise BurnError("The image SHA-256 changed before writing")
+                raise BurnError("The image SHA-256 no longer matches the verified checksum")
             raw.seek(0)
         source: Any
         if image.path.name.endswith(".img.xz"):
@@ -1221,7 +1267,7 @@ def verified_source_stream(image: ImageSpec) -> Iterator[Any]:
             if source is not raw:
                 source.close()
             if final_identity != initial_identity:
-                raise BurnError("The image file changed while it was being written")
+                raise BurnError("The image file changed while it was being read")
 
 
 def inspect_image_file(path: Path) -> Tuple[int, Tuple[int, int, int, int]]:
@@ -1289,7 +1335,237 @@ def process_stderr(process: subprocess.Popen[bytes]) -> str:
     return (stderr or b"").decode("utf-8", "replace").strip()
 
 
-def write_image(disk: Disk, image: ImageSpec) -> Tuple[str, int]:
+def read_disk_block(disk: Disk, block_start: int, length: int, sudo_session: SudoSession) -> bytes:
+    """Read one aligned block directly from a previously fingerprinted disk."""
+    if block_start < 0 or block_start % CHUNK_SIZE != 0:
+        raise BurnError("The diagnostic block offset is not aligned")
+    if length < 0 or length > CHUNK_SIZE:
+        raise BurnError("The diagnostic block length is invalid")
+    sudo_session.keep_alive()
+    ensure_same_disk(disk)
+    process = popen_or_error(
+        [
+            "sudo",
+            "-n",
+            "dd",
+            "if=" + disk.raw_device,
+            "bs=" + str(CHUNK_SIZE),
+            "iflag=direct,fullblock",
+            "skip={}".format(block_start // CHUNK_SIZE),
+            "count=1",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        preexec_fn=os.setpgrp,
+    )
+    try:
+        assert process.stdout is not None
+        block = read_up_to(process.stdout, CHUNK_SIZE)
+        stderr = process.communicate()[1].decode("utf-8", "replace")
+    except (KeyboardInterrupt, BurnError, OSError) as exc:
+        terminate_process_group(process)
+        process.wait()
+        if isinstance(exc, KeyboardInterrupt):
+            raise
+        if isinstance(exc, BurnError):
+            raise
+        raise BurnError("Could not repeat the card read at {}: {}".format(human_size(block_start), exc))
+    if process.returncode != 0:
+        raise BurnError(
+            "Could not repeat the card read at {}: {}".format(human_size(block_start), stderr.strip())
+        )
+    if len(block) < length:
+        raise BurnError(
+            "Could not repeat the card read at {}: expected {}, got {}".format(
+                human_size(block_start), human_size(length), human_size(len(block))
+            )
+        )
+    return block[:length]
+
+
+def first_difference(expected: bytes, actual: bytes) -> Optional[int]:
+    for index, (expected_byte, actual_byte) in enumerate(zip(expected, actual)):
+        if expected_byte != actual_byte:
+            return index
+    if len(expected) != len(actual):
+        return min(len(expected), len(actual))
+    return None
+
+
+def verification_mismatch_message(
+    offset: int,
+    expected_size: int,
+    card_size: int,
+    source_digest: str,
+    card_digest: str,
+    expected_block: bytes,
+    initial_block: bytes,
+    repeated_blocks: Sequence[Optional[bytes]],
+    diagnostic_errors: Sequence[Optional[str]],
+    classification: str,
+    write_time_source_digest: Optional[str] = None,
+) -> str:
+    lines = [
+        "Write verification failed at byte {} ({}): {}.".format(offset, human_size(offset), classification),
+        "Expected image bytes: {}; card bytes read: {}.".format(expected_size, card_size),
+        "Expected image SHA-256: {}.".format(source_digest),
+        "Card SHA-256: {}.".format(card_digest),
+        "Expected block SHA-256: {}.".format(hashlib.sha256(expected_block).hexdigest()),
+        "Initial card block SHA-256: {}.".format(hashlib.sha256(initial_block).hexdigest()),
+    ]
+    for number, block in enumerate(repeated_blocks, 1):
+        if block is not None:
+            lines.append("Repeated card block {} SHA-256: {}.".format(number, hashlib.sha256(block).hexdigest()))
+        diagnostic_error = diagnostic_errors[number - 1]
+        if diagnostic_error is not None:
+            lines.append("Repeated card block {} diagnostic failed: {}.".format(number, diagnostic_error))
+    if write_time_source_digest is not None:
+        lines.append(
+            "Source changed since writing: write-time SHA-256 {}; verification SHA-256 {}.".format(
+                write_time_source_digest, source_digest
+            )
+        )
+    return "\n".join(lines)
+
+
+def verify_written_image(
+    disk: Disk,
+    image: ImageSpec,
+    expected_digest: str,
+    expected_size: int,
+    sudo_session: SudoSession,
+) -> None:
+    """Compare a freshly verified image stream directly with uncached card reads."""
+    process = None  # type: Optional[subprocess.Popen[bytes]]
+    source_digest = hashlib.sha256()
+    card_digest = hashlib.sha256()
+    source_consumed = 0
+    card_consumed = 0
+    mismatch_offset = None  # type: Optional[int]
+    mismatch_block_start = None  # type: Optional[int]
+    mismatch_expected = b""
+    mismatch_actual = b""
+    started = time.monotonic()
+    try:
+        with verified_source_stream(image) as source:
+            sudo_session.keep_alive()
+            ensure_same_disk(disk)
+            process = popen_or_error(
+                [
+                    "sudo",
+                    "-n",
+                    "dd",
+                    "if=" + disk.raw_device,
+                    "bs=" + str(CHUNK_SIZE),
+                    "iflag=direct,fullblock",
+                    "count={}".format((expected_size + CHUNK_SIZE - 1) // CHUNK_SIZE),
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                preexec_fn=os.setpgrp,
+            )
+            assert process.stdout is not None
+            while source_consumed < expected_size:
+                block_start = source_consumed
+                block_size = min(CHUNK_SIZE, expected_size - source_consumed)
+                expected_block = read_up_to(source, block_size)
+                if len(expected_block) != block_size:
+                    raise BurnError(
+                        "The image size changed before verification: expected {}, got {}".format(
+                            human_size(expected_size), human_size(source_consumed + len(expected_block))
+                        )
+                    )
+                actual_block = read_up_to(process.stdout, block_size)
+                source_digest.update(expected_block)
+                card_digest.update(actual_block)
+                source_consumed += len(expected_block)
+                card_consumed += len(actual_block)
+                if mismatch_offset is None:
+                    difference = first_difference(expected_block, actual_block)
+                    if difference is not None:
+                        mismatch_offset = block_start + difference
+                        mismatch_block_start = block_start
+                        mismatch_expected = expected_block
+                        mismatch_actual = actual_block
+                show_progress("Verifying written image", card_consumed, expected_size, started)
+                sudo_session.keep_alive()
+            if read_up_to(source, 1):
+                raise BurnError("The image size changed before verification: it contains more data than expected")
+            stderr = process.communicate()[1].decode("utf-8", "replace")
+    except (KeyboardInterrupt, BurnError, EOFError, lzma.LZMAError, OSError) as exc:
+        if process is not None:
+            terminate_process_group(process)
+            process.wait()
+        if isinstance(exc, KeyboardInterrupt):
+            raise
+        if isinstance(exc, BurnError):
+            raise
+        raise BurnError("Could not verify the written image: {}".format(exc))
+    print()
+    assert process is not None
+    if process.returncode != 0:
+        raise BurnError("Could not read {}: {}".format(disk.device, stderr.strip()))
+
+    fresh_source_digest = source_digest.hexdigest()
+    source_changed = fresh_source_digest != expected_digest
+    if source_changed and mismatch_offset is None:
+        raise BurnError(
+            "Image data changed between writing and verification: expected SHA-256 {}, got {}".format(
+                expected_digest, fresh_source_digest
+            )
+        )
+    if mismatch_offset is None and card_consumed != expected_size:
+        mismatch_offset = card_consumed
+        mismatch_block_start = card_consumed - card_consumed % CHUNK_SIZE
+        mismatch_expected = b""
+        mismatch_actual = b""
+    if mismatch_offset is None:
+        if card_digest.hexdigest() != fresh_source_digest:
+            raise BurnError("Write verification failed despite byte-for-byte comparison")
+        return
+
+    assert mismatch_block_start is not None
+    repeated_blocks = []  # type: List[Optional[bytes]]
+    diagnostic_errors = []  # type: List[Optional[str]]
+    for _attempt in range(2):
+        try:
+            repeated_blocks.append(
+                read_disk_block(disk, mismatch_block_start, len(mismatch_expected), sudo_session)
+            )
+            diagnostic_errors.append(None)
+        except BurnError as exc:
+            repeated_blocks.append(None)
+            diagnostic_errors.append(str(exc))
+
+    if all(block is not None and block == mismatch_expected for block in repeated_blocks):
+        classification = "the initial direct read was transiently inconsistent"
+    elif (
+        mismatch_actual != mismatch_expected
+        and all(block is not None and block == mismatch_actual for block in repeated_blocks)
+    ):
+        classification = "the card contains stable data that differs from the image"
+    elif all(block is not None for block in repeated_blocks):
+        classification = "the card, reader, or USB path returned unstable data"
+    else:
+        classification = "the card data differs from the image"
+    raise BurnError(
+        verification_mismatch_message(
+            mismatch_offset,
+            expected_size,
+            card_consumed,
+            fresh_source_digest,
+            card_digest.hexdigest(),
+            mismatch_expected,
+            mismatch_actual,
+            repeated_blocks,
+            diagnostic_errors,
+            classification,
+            expected_digest if source_changed else None,
+        )
+    )
+
+
+def write_image(disk: Disk, image: ImageSpec, sudo_session: SudoSession) -> Tuple[str, int]:
     image_size = image.uncompressed_size
     if image_size is None:
         image_size, identity = inspect_image_file(image.path)
@@ -1315,12 +1591,12 @@ def write_image(disk: Disk, image: ImageSpec) -> Tuple[str, int]:
         with verified_source_stream(image) as source:
             # The source has been opened and re-verified before the first
             # destructive operation, closing the common replace-after-check race.
-            refresh_sudo()
+            sudo_session.keep_alive()
             ensure_same_disk(disk)
             unmount_disk(disk)
             ensure_same_disk(disk)
             process = popen_or_error(
-                ["sudo", "-n", "dd", "of=" + disk.raw_device, "bs=" + str(CHUNK_SIZE)],
+                ["sudo", "-n", "dd", "of=" + disk.raw_device, "bs=" + str(CHUNK_SIZE), "conv=fsync"],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
@@ -1333,10 +1609,11 @@ def write_image(disk: Disk, image: ImageSpec) -> Tuple[str, int]:
                     break
                 if written + len(chunk) > disk.size:
                     raise BurnError("The decompressed image is larger than the selected card")
-                process.stdin.write(chunk)
+                write_all(process.stdin, chunk)
                 digest.update(chunk)
                 written += len(chunk)
                 show_progress("Writing Ubuntu", written, 0, started)
+                sudo_session.keep_alive()
             if written != image_size:
                 raise BurnError(
                     "The image size changed while writing: expected {}, got {}".format(
@@ -1356,11 +1633,14 @@ def write_image(disk: Disk, image: ImageSpec) -> Tuple[str, int]:
                 # preserve its actual diagnostic instead of masking it with
                 # Python's secondary EPIPE exception.
                 detail = process_stderr(process)
+                returncode = process.returncode
+                if returncode is None:
+                    terminate_process_group(process)
             else:
                 if process.poll() is None:
                     terminate_process_group(process)
                 detail = process_stderr(process)
-            returncode = process.returncode
+                returncode = process.returncode
         if isinstance(exc, KeyboardInterrupt):
             raise
         if isinstance(exc, BurnError):
@@ -1494,6 +1774,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument("--image", help="local .img/.img.xz or URL; defaults to the latest stable Ubuntu")
     parser.add_argument("--sha256", help="SHA-256 checksum for --image")
+    parser.add_argument(
+        "--keep-image-on-failure",
+        metavar="DIR",
+        help="preserve a downloaded image and diagnostic report under DIR if the run fails",
+    )
     inventory_group = parser.add_mutually_exclusive_group()
     inventory_group.add_argument("--inventory", dest="inventory", action="store_true", help="create an inventory")
     inventory_group.add_argument(
@@ -1561,7 +1846,7 @@ def validate_args(args: argparse.Namespace) -> None:
             raise BurnError("Password login in --non-interactive mode requires --user-password-env")
 
 
-def choose_disk() -> Disk:
+def choose_disk(heartbeat: Optional[Callable[[], None]] = None) -> Disk:
     latest = {}  # type: Dict[str, Disk]
 
     def provider() -> Sequence[Tuple[str, str]]:
@@ -1570,15 +1855,26 @@ def choose_disk() -> Disk:
             latest[disk.identifier] = disk
         return [(key, disk.label + " — WILL BE COMPLETELY ERASED") for key, disk in latest.items()]
 
-    identifier = choose_dynamic("Select a memory card:", provider, refresh_interval=1.0)
+    identifier = choose_dynamic(
+        "Select a memory card:",
+        provider,
+        refresh_interval=1.0,
+        heartbeat=heartbeat,
+    )
     return latest.get(identifier) or get_disk(identifier)
 
 
-def wait_for_disk(identifier_or_path: str, poll_interval: float = 1.0) -> Disk:
+def wait_for_disk(
+    identifier_or_path: str,
+    poll_interval: float = 1.0,
+    heartbeat: Optional[Callable[[], None]] = None,
+) -> Disk:
     identifier = normalize_disk_identifier(identifier_or_path)
     device_path = "/dev/" + identifier
     waiting_message_shown = False
     while True:
+        if heartbeat is not None:
+            heartbeat()
         try:
             disk = get_disk(identifier_or_path)
             if waiting_message_shown:
@@ -1595,7 +1891,7 @@ def wait_for_disk(identifier_or_path: str, poll_interval: float = 1.0) -> Disk:
             time.sleep(poll_interval)
 
 
-def failed_check_action() -> bool:
+def failed_check_action(heartbeat: Optional[Callable[[], None]] = None) -> bool:
     """Return True to skip the failed check, False to return to disk selection."""
     choice = choose_dynamic(
         "The card failed the integrity test. Choose what to do:",
@@ -1603,8 +1899,71 @@ def failed_check_action() -> bool:
             ("back", "return to card selection"),
             ("skip", "skip the test and continue with this card"),
         ],
+        heartbeat=heartbeat,
     )
     return choice == "skip"
+
+
+def diagnostic_source(source: str) -> str:
+    parsed = urllib.parse.urlsplit(source)
+    if parsed.scheme not in ("http", "https"):
+        return source
+    hostname = parsed.hostname or ""
+    netloc = hostname
+    try:
+        port = parsed.port
+    except ValueError:
+        port = None
+    if port is not None:
+        netloc += ":{}".format(port)
+    return urllib.parse.urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
+
+
+def preserve_failure_artifacts(
+    destination: Path,
+    image: ImageSpec,
+    image_size: Optional[int],
+    disk: Optional[Disk],
+    error: BaseException,
+) -> Tuple[Optional[Path], Path]:
+    """Preserve a downloaded image and a secret-free report after a failed run."""
+    try:
+        destination = destination.expanduser().resolve()
+        destination.mkdir(parents=True, exist_ok=True)
+        artifact_directory = Path(tempfile.mkdtemp(prefix="piburn-failure-", dir=str(destination)))
+        saved_image = None  # type: Optional[Path]
+        if urllib.parse.urlsplit(image.source).scheme in ("http", "https") and image.path.exists():
+            saved_image = artifact_directory / image.path.name
+            if image.path.stat().st_dev != artifact_directory.stat().st_dev:
+                raise BurnError(
+                    "The downloaded image and failure directory are on different filesystems; "
+                    "refusing to copy the image"
+                )
+            os.replace(str(image.path), str(saved_image))
+        report = artifact_directory / "diagnostic.txt"
+        lines = [
+            "Source: {}".format(diagnostic_source(image.source)),
+            "Compressed SHA-256: {}".format(image.compressed_sha256 or "not provided"),
+            "Decompressed size: {}".format(image_size if image_size is not None else "unknown"),
+        ]
+        if disk is not None:
+            lines.extend(
+                [
+                    "Disk: {}".format(disk.device),
+                    "Disk fingerprint: {}".format(json.dumps(disk.fingerprint)),
+                ]
+            )
+        lines.extend(
+            [
+                "Error type: {}".format(type(error).__name__),
+                "Error: {}".format(error),
+                "",
+            ]
+        )
+        report.write_text("\n".join(lines), encoding="utf-8")
+        return saved_image, report
+    except OSError as exc:
+        raise BurnError("Could not preserve failure artifacts: {}".format(exc))
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -1685,51 +2044,73 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         del user_password
 
     hosts = []  # type: List[str]
-    with tempfile.TemporaryDirectory(prefix="cluster-burn-") as temporary_directory:
-        print("Finding and verifying the latest stable Ubuntu Server image for Raspberry Pi...")
-        image = resolve_image(args.image, args.sha256, Path(temporary_directory))
-        print("Image: {}".format(image.source))
-        image_size = image.uncompressed_size
-        if image_size is None:
-            print("Verifying the decompressed image before card selection...")
-            image_size, identity = inspect_image_file(image.path)
-            image = dataclasses.replace(
-                image,
-                uncompressed_size=image_size,
-                file_identity=identity,
-            )
-        print("Decompressed image size: {}".format(human_size(image_size)))
-        ensure_sudo()
-
-        current_disk = None  # type: Optional[Disk]
+    artifact_destination = Path(args.keep_image_on_failure) if args.keep_image_on_failure else None
+    artifact_setup_error = None  # type: Optional[Exception]
+    download_parent = None  # type: Optional[Path]
+    remote_image_requested = not args.image or urllib.parse.urlsplit(args.image).scheme in ("http", "https")
+    if artifact_destination is not None and remote_image_requested:
         try:
+            artifact_destination = artifact_destination.expanduser().resolve()
+            artifact_destination.mkdir(parents=True, exist_ok=True)
+            download_parent = artifact_destination
+        except Exception as exc:
+            artifact_setup_error = exc
+    with tempfile.TemporaryDirectory(
+        prefix=".piburn-working-",
+        dir=str(download_parent) if download_parent is not None else None,
+    ) as temporary_directory:
+        image = None  # type: Optional[ImageSpec]
+        image_size = None  # type: Optional[int]
+        current_disk = None  # type: Optional[Disk]
+        last_selected_disk = None  # type: Optional[Disk]
+        try:
+            print("Finding and verifying the latest stable Ubuntu Server image for Raspberry Pi...")
+            image = resolve_image(args.image, args.sha256, Path(temporary_directory))
+            print("Image: {}".format(image.source))
+            image_size = image.uncompressed_size
+            if image_size is None:
+                print("Verifying the decompressed image before card selection...")
+                image_size, identity = inspect_image_file(image.path)
+                image = dataclasses.replace(
+                    image,
+                    uncompressed_size=image_size,
+                    file_identity=identity,
+                )
+            print("Decompressed image size: {}".format(human_size(image_size)))
+            sudo_session = ensure_sudo()
+
             for card_number in range(1, count + 1):
                 hostname = hostname_for(prefix, start_number + card_number - 1)
                 print("\nCard {}/{} → {}.local".format(card_number, count, hostname))
                 forced_device = args.device[card_number - 1] if args.device else None
                 while True:
                     if forced_device:
-                        current_disk = wait_for_disk(forced_device)
+                        current_disk = wait_for_disk(forced_device, heartbeat=sudo_session.keep_alive)
                     else:
-                        current_disk = choose_disk()
+                        current_disk = choose_disk(heartbeat=sudo_session.keep_alive)
+                    last_selected_disk = current_disk
                     print("Selected: {}".format(current_disk.label))
-                    if not check_cards or check_media(current_disk):
+                    if not check_cards or check_media(current_disk, sudo_session):
                         break
                     if args.non_interactive:
                         if args.on_check_failure == "skip":
                             break
                         raise BurnError("Card {} failed the integrity test".format(current_disk.device))
-                    if failed_check_action():
+                    if failed_check_action(heartbeat=sudo_session.keep_alive):
                         break
                     current_disk = None
                     forced_device = None
 
-                image_digest, image_size = write_image(current_disk, image)
+                image_digest, image_size = write_image(current_disk, image, sudo_session)
                 if check_cards:
                     print("Verifying the written image...")
-                    actual_digest = read_stream_from_disk(current_disk, image_size, "Verifying written image")
-                    if actual_digest != image_digest:
-                        raise BurnError("Write verification failed: card data differs from the image")
+                    verify_written_image(
+                        current_disk,
+                        image,
+                        image_digest,
+                        image_size,
+                        sudo_session,
+                    )
                 write_cloud_init(
                     current_disk,
                     hostname,
@@ -1746,28 +2127,46 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 )
                 hosts.append(hostname + ".local")
                 current_disk = None
-        except BaseException:
+
+            create_inventory = args.inventory
+            if create_inventory is None:
+                create_inventory = ask_yes_no("Generate an Ansible inventory?", default=True)
+            inventory_default = args.inventory_path or "ansible/inventory.ini"
+            inventory_path = Path(inventory_default)
+            if create_inventory:
+                if args.inventory is None and args.inventory_path is None and not args.non_interactive:
+                    entered = input("Inventory path [{}]: ".format(inventory_default)).strip()
+                    if entered:
+                        inventory_path = Path(entered)
+                write_inventory(inventory_path, hosts, username)
+                print("Inventory written to: {}".format(inventory_path.expanduser().resolve()))
+
+            print("\nFlashed cards: {}".format(len(hosts)))
+            print("SSH commands:")
+            for host in hosts:
+                print("ssh {}@{}".format(username, host))
+        except BaseException as exc:
             if current_disk is not None:
-                eject_disk(current_disk, quiet=True)
+                try:
+                    eject_disk(current_disk, quiet=True)
+                except BurnError as eject_error:
+                    eprint("Warning: emergency ejection failed: {}".format(eject_error))
+            if artifact_destination is not None and image is not None:
+                if artifact_setup_error is not None:
+                    eprint("Warning: could not prepare failure artifacts: {}".format(artifact_setup_error))
+                    raise
+                try:
+                    saved_image, report = preserve_failure_artifacts(
+                        artifact_destination, image, image_size, last_selected_disk, exc
+                    )
+                    if saved_image is not None:
+                        eprint("Failure image preserved at: {}".format(saved_image))
+                    else:
+                        eprint("Local image remains at: {}".format(image.path))
+                    eprint("Diagnostic report written to: {}".format(report))
+                except BaseException as preservation_error:
+                    eprint("Warning: {}".format(preservation_error))
             raise
-
-    create_inventory = args.inventory
-    if create_inventory is None:
-        create_inventory = ask_yes_no("Generate an Ansible inventory?", default=True)
-    inventory_default = args.inventory_path or "ansible/inventory.ini"
-    inventory_path = Path(inventory_default)
-    if create_inventory:
-        if args.inventory is None and args.inventory_path is None and not args.non_interactive:
-            entered = input("Inventory path [{}]: ".format(inventory_default)).strip()
-            if entered:
-                inventory_path = Path(entered)
-        write_inventory(inventory_path, hosts, username)
-        print("Inventory written to: {}".format(inventory_path.expanduser().resolve()))
-
-    print("\nFlashed cards: {}".format(len(hosts)))
-    print("SSH commands:")
-    for host in hosts:
-        print("ssh {}@{}".format(username, host))
     return 0
 
 
