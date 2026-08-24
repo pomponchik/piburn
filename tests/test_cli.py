@@ -1149,11 +1149,13 @@ def test_long_transfer_preserves_safety_and_heartbeat_contract(operation):
     assert sudo_session.keep_alive.call_args_list == [mock.call()] * 4
     sudo_session.authenticate.assert_not_called()
     expected_events = ["heartbeat", "fingerprint"]
-    if is_write:
+    if is_write or operation == "image-read":
         expected_events.extend(["unmount", "fingerprint"])
     expected_events.extend(["dd", "block", "heartbeat", "block", "heartbeat", "block", "heartbeat"])
-    if is_write:
+    if operation == "integrity-write":
         expected_events.append("sync")
+    elif operation == "image-write":
+        expected_events.extend(["sync", "unmount", "fingerprint"])
     assert events == expected_events
     progress_label, progress_total = {
         "integrity-write": ("Integrity test write", len(data)),
@@ -1182,18 +1184,27 @@ def test_long_transfer_preserves_safety_and_heartbeat_contract(operation):
         expected_popen_kwargs["stdin"] = burn.subprocess.PIPE
     popen.assert_called_once_with(expected_command, **expected_popen_kwargs)
     assert process.communicate_calls == 1
-    expected_disk_check_count = 2 if is_write else 1
+    expected_disk_check_count = {
+        "integrity-write": 2,
+        "integrity-read": 1,
+        "image-write": 3,
+        "image-read": 2,
+    }[operation]
     assert ensure_same_disk.call_args_list == [mock.call(disk)] * expected_disk_check_count
 
-    if is_write:
+    if operation == "image-write":
+        assert unmount.call_args_list == [mock.call(disk), mock.call(disk)]
+    elif operation in ("integrity-write", "image-read"):
         unmount.assert_called_once_with(disk)
+    else:
+        unmount.assert_not_called()
+    if is_write:
         run.assert_called_once_with(["sync"], capture=False)
         expected_payload = expected_integrity_payload if operation == "integrity-write" else data
         assert process.input_stream.getvalue() == expected_payload
         assert process.input_stream.was_closed is True
         assert process.stdin is None
     else:
-        unmount.assert_not_called()
         run.assert_not_called()
         assert process.stdout.tell() == len(data)
 
@@ -1220,6 +1231,8 @@ def test_verify_written_image_uses_image_size_instead_of_full_card_size(byte_lim
     with mock.patch.object(burn, "CHUNK_SIZE", 4), mock.patch.object(
         burn, "ensure_same_disk"
     ) as ensure_same_disk, mock.patch.object(
+        burn, "unmount_disk"
+    ) as unmount, mock.patch.object(
         burn, "popen_or_error", return_value=process
     ) as popen, mock.patch.object(burn, "show_progress") as progress, mock.patch.object(
         burn,
@@ -1246,7 +1259,8 @@ def test_verify_written_image_uses_image_size_instead_of_full_card_size(byte_lim
     assert popen.call_args.args[0] == expected_command
     assert result is None
     assert process.stdout.tell() == byte_limit
-    ensure_same_disk.assert_called_once_with(disk)
+    assert ensure_same_disk.call_args_list == [mock.call(disk), mock.call(disk)]
+    unmount.assert_called_once_with(disk)
     assert sudo_session.keep_alive.call_args_list == [mock.call()] * (expected_dd_block_count + 1)
     sudo_session.authenticate.assert_not_called()
     source_stream.assert_called_once()
@@ -1280,6 +1294,8 @@ def test_verify_written_image_joins_short_source_and_card_reads():
     sudo_session = mock.Mock(spec=burn.SudoSession)
     with mock.patch.object(burn, "CHUNK_SIZE", 4), mock.patch.object(
         burn, "ensure_same_disk"
+    ), mock.patch.object(
+        burn, "unmount_disk"
     ), mock.patch.object(burn, "popen_or_error", return_value=process), mock.patch.object(
         burn, "show_progress"
     ) as progress, mock.patch.object(
@@ -1322,6 +1338,8 @@ def test_verify_written_image_reopens_and_revalidates_source(tmp_path):
     with mock.patch.object(burn, "CHUNK_SIZE", 4), mock.patch.object(
         burn, "ensure_same_disk"
     ) as ensure_same_disk, mock.patch.object(
+        burn, "unmount_disk"
+    ) as unmount, mock.patch.object(
         burn, "popen_or_error", return_value=process
     ) as popen, mock.patch.object(
         burn, "show_progress"
@@ -1335,6 +1353,7 @@ def test_verify_written_image_reopens_and_revalidates_source(tmp_path):
         )
         sudo_session.reset_mock()
         ensure_same_disk.reset_mock()
+        unmount.reset_mock()
         popen.reset_mock()
         invalid_checksum_image = dataclasses.replace(image, compressed_sha256="0" * 64)
         with pytest.raises(burn.BurnError, match="no longer matches the verified checksum"):
@@ -1350,6 +1369,7 @@ def test_verify_written_image_reopens_and_revalidates_source(tmp_path):
     assert process.stdout.tell() == len(data)
     sudo_session.keep_alive.assert_not_called()
     ensure_same_disk.assert_not_called()
+    unmount.assert_not_called()
     popen.assert_not_called()
 
 
@@ -1372,6 +1392,8 @@ def test_verify_written_image_stops_dd_after_decompression_failure(tmp_path):
     sudo_session = mock.Mock(spec=burn.SudoSession)
     with mock.patch.object(burn, "CHUNK_SIZE", 4), mock.patch.object(
         burn, "ensure_same_disk"
+    ), mock.patch.object(
+        burn, "unmount_disk"
     ), mock.patch.object(
         burn, "popen_or_error", return_value=process
     ) as popen, mock.patch.object(burn, "show_progress"), mock.patch.object(
@@ -1436,6 +1458,8 @@ def test_verify_written_image_rejects_source_size_changes(
     sudo_session = mock.Mock(spec=burn.SudoSession)
     with mock.patch.object(burn, "CHUNK_SIZE", 4), mock.patch.object(
         burn, "ensure_same_disk"
+    ), mock.patch.object(
+        burn, "unmount_disk"
     ), mock.patch.object(burn, "popen_or_error", return_value=process), mock.patch.object(
         burn, "show_progress"
     ) as progress, mock.patch.object(
@@ -1478,16 +1502,25 @@ def test_read_disk_block_joins_short_reads_with_direct_aligned_dd(
     process = FakeDDProcess()
     process.stdout = FragmentedReader(dd_output)
     sudo_session = mock.Mock(spec=burn.SudoSession)
+
+    def start_dd(*_args, **_kwargs):
+        assert ensure_same_disk.call_args_list == [mock.call(disk), mock.call(disk)]
+        unmount.assert_called_once_with(disk)
+        return process
+
     with mock.patch.object(burn, "CHUNK_SIZE", 4), mock.patch.object(
         burn, "ensure_same_disk"
     ) as ensure_same_disk, mock.patch.object(
-        burn, "popen_or_error", return_value=process
+        burn, "unmount_disk"
+    ) as unmount, mock.patch.object(
+        burn, "popen_or_error", side_effect=start_dd
     ) as popen:
         block = burn.read_disk_block(disk, block_start, length, sudo_session)
 
     assert block == expected_block
     sudo_session.keep_alive.assert_called_once_with()
-    ensure_same_disk.assert_called_once_with(disk)
+    assert ensure_same_disk.call_args_list == [mock.call(disk), mock.call(disk)]
+    unmount.assert_called_once_with(disk)
     popen.assert_called_once_with(
         [
             "sudo",
@@ -1524,7 +1557,9 @@ def test_read_disk_block_rejects_invalid_range_before_disk_access(
     sudo_session = mock.Mock(spec=burn.SudoSession)
     with mock.patch.object(burn, "CHUNK_SIZE", 4), mock.patch.object(
         burn, "ensure_same_disk"
-    ) as ensure_same_disk, mock.patch.object(burn, "popen_or_error") as popen, pytest.raises(
+    ) as ensure_same_disk, mock.patch.object(burn, "unmount_disk") as unmount, mock.patch.object(
+        burn, "popen_or_error"
+    ) as popen, pytest.raises(
         burn.BurnError
     ) as raised:
         burn.read_disk_block(disk, block_start, length, sudo_session)
@@ -1532,6 +1567,7 @@ def test_read_disk_block_rejects_invalid_range_before_disk_access(
     assert str(raised.value) == expected_message
     sudo_session.keep_alive.assert_not_called()
     ensure_same_disk.assert_not_called()
+    unmount.assert_not_called()
     popen.assert_not_called()
 
 
@@ -1551,7 +1587,9 @@ def test_read_disk_block_propagates_preflight_failure_before_starting_dd(failing
     fingerprint_side_effect = preflight_error if failing_check == "fingerprint" else None
     with mock.patch.object(burn, "CHUNK_SIZE", 4), mock.patch.object(
         burn, "ensure_same_disk", side_effect=fingerprint_side_effect
-    ) as ensure_same_disk, mock.patch.object(burn, "popen_or_error") as popen, pytest.raises(
+    ) as ensure_same_disk, mock.patch.object(burn, "unmount_disk") as unmount, mock.patch.object(
+        burn, "popen_or_error"
+    ) as popen, pytest.raises(
         type(preflight_error)
     ) as raised:
         burn.read_disk_block(disk, 4, 4, sudo_session)
@@ -1562,6 +1600,7 @@ def test_read_disk_block_propagates_preflight_failure_before_starting_dd(failing
         ensure_same_disk.assert_not_called()
     else:
         ensure_same_disk.assert_called_once_with(disk)
+    unmount.assert_not_called()
     popen.assert_not_called()
 
 
@@ -1573,7 +1612,9 @@ def test_read_disk_block_reports_dd_failure():
     sudo_session = mock.Mock(spec=burn.SudoSession)
     with mock.patch.object(burn, "CHUNK_SIZE", 4), mock.patch.object(
         burn, "ensure_same_disk"
-    ), mock.patch.object(burn, "popen_or_error", return_value=process) as popen, pytest.raises(
+    ), mock.patch.object(burn, "unmount_disk"), mock.patch.object(
+        burn, "popen_or_error", return_value=process
+    ) as popen, pytest.raises(
         burn.BurnError
     ) as raised:
         burn.read_disk_block(disk, 4, 4, sudo_session)
@@ -1599,6 +1640,8 @@ def test_read_disk_block_stops_dd_after_pipe_failure_or_cancellation(read_error)
     sudo_session = mock.Mock(spec=burn.SudoSession)
     with mock.patch.object(burn, "CHUNK_SIZE", 4), mock.patch.object(
         burn, "ensure_same_disk"
+    ), mock.patch.object(
+        burn, "unmount_disk"
     ), mock.patch.object(burn, "popen_or_error", return_value=process), mock.patch.object(
         burn.os, "killpg"
     ) as killpg, pytest.raises((burn.BurnError, KeyboardInterrupt)) as raised:
@@ -1622,7 +1665,9 @@ def test_read_disk_block_rejects_short_output():
     sudo_session = mock.Mock(spec=burn.SudoSession)
     with mock.patch.object(burn, "CHUNK_SIZE", 4), mock.patch.object(
         burn, "ensure_same_disk"
-    ), mock.patch.object(burn, "popen_or_error", return_value=process), pytest.raises(
+    ), mock.patch.object(burn, "unmount_disk"), mock.patch.object(
+        burn, "popen_or_error", return_value=process
+    ), pytest.raises(
         burn.BurnError
     ) as raised:
         burn.read_disk_block(disk, 4, 4, sudo_session)
@@ -1661,6 +1706,8 @@ def test_verify_written_image_classifies_repeated_block_reads(repeat_mode, class
     sudo_session = mock.Mock(spec=burn.SudoSession)
     with mock.patch.object(burn, "CHUNK_SIZE", 4), mock.patch.object(
         burn, "ensure_same_disk"
+    ), mock.patch.object(
+        burn, "unmount_disk"
     ), mock.patch.object(burn, "popen_or_error", return_value=process), mock.patch.object(
         burn, "show_progress"
     ), mock.patch.object(
@@ -1754,6 +1801,8 @@ def test_verify_written_image_reports_exact_first_mismatch(mismatch_offsets):
     wrong_block = bytes(card_data[block_start : block_start + block_length])
     with mock.patch.object(burn, "CHUNK_SIZE", 4), mock.patch.object(
         burn, "ensure_same_disk"
+    ), mock.patch.object(
+        burn, "unmount_disk"
     ), mock.patch.object(burn, "popen_or_error", return_value=process), mock.patch.object(
         burn, "show_progress"
     ), mock.patch.object(
@@ -1789,6 +1838,8 @@ def test_verify_written_image_rejects_changed_source_before_block_diagnostics():
     sudo_session = mock.Mock(spec=burn.SudoSession)
     with mock.patch.object(burn, "CHUNK_SIZE", 4), mock.patch.object(
         burn, "ensure_same_disk"
+    ), mock.patch.object(
+        burn, "unmount_disk"
     ), mock.patch.object(burn, "popen_or_error", return_value=process), mock.patch.object(
         burn, "show_progress"
     ), mock.patch.object(
@@ -1818,6 +1869,8 @@ def test_verify_written_image_reports_mismatch_and_changed_source_together():
     sudo_session = mock.Mock(spec=burn.SudoSession)
     with mock.patch.object(burn, "CHUNK_SIZE", 4), mock.patch.object(
         burn, "ensure_same_disk"
+    ), mock.patch.object(
+        burn, "unmount_disk"
     ), mock.patch.object(burn, "popen_or_error", return_value=process), mock.patch.object(
         burn, "show_progress"
     ), mock.patch.object(
@@ -1883,6 +1936,8 @@ def test_verification_preserves_mismatch_when_one_diagnostic_read_fails(
     sudo_session = mock.Mock(spec=burn.SudoSession)
     with mock.patch.object(burn, "CHUNK_SIZE", 4), mock.patch.object(
         burn, "ensure_same_disk"
+    ), mock.patch.object(
+        burn, "unmount_disk"
     ), mock.patch.object(burn, "popen_or_error", return_value=process), mock.patch.object(
         burn, "show_progress"
     ), mock.patch.object(
@@ -2041,15 +2096,17 @@ def test_transfer_terminates_dd_and_propagates_sudo_failure_or_cancellation(
     assert process.returncode == -15
     assert process.wait_calls == (1 if operation == "image-write" else 2)
     run.assert_not_called()
-    assert ensure_same_disk.call_count == (2 if operation.endswith("write") else 1)
-    if operation.endswith("write"):
+    assert ensure_same_disk.call_count == (1 if operation == "integrity-read" else 2)
+    if operation != "integrity-read":
         unmount.assert_called_once_with(disk)
+    else:
+        unmount.assert_not_called()
+    if operation.endswith("write"):
         expected_payload = burn.integrity_pattern(b"s" * 32, 0, 4) if operation == "integrity-write" else data[:4]
         assert process.input_stream.getvalue() == expected_payload
         assert process.input_stream.was_closed is True
         assert process.stdin is None
     else:
-        unmount.assert_not_called()
         assert process.stdout.tell() == 4
     if operation.startswith("image-"):
         source_stream.assert_called_once_with(image)
@@ -2310,6 +2367,8 @@ def test_verify_integrity_pattern_joins_short_pipe_reads():
     with mock.patch.object(burn, "CHUNK_SIZE", 4), mock.patch.object(
         burn, "INTEGRITY_PATTERN_BLOCK_SIZE", 4
     ), mock.patch.object(burn, "ensure_same_disk"), mock.patch.object(
+        burn, "unmount_disk"
+    ), mock.patch.object(
         burn, "popen_or_error", return_value=process
     ), mock.patch.object(burn, "show_progress"):
         process.stdout = FragmentedReader(burn.integrity_pattern(seed, 0, disk.size))
@@ -2344,6 +2403,8 @@ def test_verify_integrity_pattern_rejects_corrupted_data(
     with mock.patch.object(burn, "CHUNK_SIZE", 4), mock.patch.object(
         burn, "INTEGRITY_PATTERN_BLOCK_SIZE", 4
     ), mock.patch.object(burn, "ensure_same_disk"), mock.patch.object(
+        burn, "unmount_disk"
+    ), mock.patch.object(
         burn, "popen_or_error", return_value=process
     ), mock.patch.object(burn, "show_progress"), mock.patch.object(burn.os, "killpg") as killpg:
         corrupted_data = bytearray(burn.integrity_pattern(b"s" * 32, 0, disk.size))
@@ -2377,6 +2438,8 @@ def test_disk_read_rejects_truncated_stream(operation, card_data, expected_bytes
     with mock.patch.object(burn, "CHUNK_SIZE", 4), mock.patch.object(
         burn, "INTEGRITY_PATTERN_BLOCK_SIZE", 4
     ), mock.patch.object(burn, "ensure_same_disk"), mock.patch.object(
+        burn, "unmount_disk"
+    ), mock.patch.object(
         burn, "popen_or_error", return_value=process
     ), mock.patch.object(burn, "show_progress"), mock.patch.object(
         burn,
