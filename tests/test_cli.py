@@ -18,6 +18,23 @@ import pytest
 from piburn import cli as burn
 
 
+@pytest.fixture
+def automatic_mount_guard(monkeypatch):
+    """Replace the macOS helper with an ordered in-process guard for main tests."""
+    events = []
+
+    @burn.contextlib.contextmanager
+    def guard(disk, sudo_session):
+        events.append(("enter", disk, sudo_session))
+        try:
+            yield
+        finally:
+            events.append(("exit", disk, sudo_session))
+
+    monkeypatch.setattr(burn, "prevent_automatic_mounts", guard)
+    return events
+
+
 def test_terminal_parser_handles_fragmented_arrow_sequences():
     parser = burn.TerminalInputParser()
     assert parser.feed(b"\x1b") == []
@@ -657,6 +674,126 @@ def test_sudo_session_does_not_refresh_before_deadline():
 
     run.assert_not_called()
     assert session.next_refresh == 160.0
+
+
+def test_sudo_session_runs_attached_heartbeats_before_sudo_refresh_checks():
+    """Run every operation heartbeat even while the sudo refresh deadline is still current."""
+
+    session = burn.SudoSession()
+    session.next_refresh = 160.0
+    first_heartbeat = mock.Mock()
+    second_heartbeat = mock.Mock()
+    session.add_heartbeat(first_heartbeat)
+    session.add_heartbeat(second_heartbeat)
+    with mock.patch.object(burn, "run") as run, mock.patch.object(burn.time, "monotonic", return_value=100.0):
+        session.keep_alive()
+        session.remove_heartbeat(first_heartbeat)
+        session.keep_alive()
+
+    assert first_heartbeat.call_args_list == [mock.call()]
+    assert second_heartbeat.call_args_list == [mock.call(), mock.call()]
+    run.assert_not_called()
+
+
+def test_automatic_mount_guard_starts_exact_helper_and_reaps_it():
+    """Start the unprivileged helper for only the selected disk and reap it on exit."""
+
+    disk = burn.Disk("disk7", "Micro SD/M2", 32 * 1024**3, "USB", False, True, True)
+    process = mock.Mock()
+    process.stdout = io.BytesIO(b"READY\n")
+    process.poll.return_value = None
+    process.communicate.return_value = (b"", b"")
+    with mock.patch.object(burn, "ensure_same_disk", return_value=disk) as ensure_disk, mock.patch.object(
+        burn.subprocess, "Popen", return_value=process
+    ) as popen, mock.patch.object(burn.select, "select", return_value=([process.stdout], [], [])):
+        guard = burn.AutomaticMountGuard(disk)
+        guard.start()
+        guard.keep_alive()
+        assert guard.stop() == ""
+
+    ensure_disk.assert_called_once_with(disk)
+    popen.assert_called_once_with(
+        [burn.sys.executable, "-m", "piburn._mount_guard", "disk7"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    process.terminate.assert_called_once_with()
+    process.communicate.assert_called_once_with(timeout=3)
+
+
+def test_automatic_mount_guard_heartbeat_failure_propagates_and_detaches():
+    """Propagate a dead helper through the sudo heartbeat and detach it after cleanup."""
+
+    disk = burn.Disk("disk7", "Micro SD/M2", 32 * 1024**3, "USB", False, True, True)
+    session = burn.SudoSession()
+    session.next_refresh = 160.0
+    guard = mock.Mock(spec=burn.AutomaticMountGuard)
+    guard.keep_alive.side_effect = [None, burn.BurnError("guard stopped")]
+    with mock.patch.object(burn, "AutomaticMountGuard", return_value=guard), mock.patch.object(
+        burn.time, "monotonic", return_value=100.0
+    ), pytest.raises(burn.BurnError, match="guard stopped"):
+        with burn.prevent_automatic_mounts(disk, session):
+            session.keep_alive()
+
+    guard.start.assert_called_once_with()
+    guard.stop.assert_called_once_with()
+    assert session._heartbeats == []
+
+
+def test_automatic_mount_guard_reports_startup_and_runtime_failures():
+    """Report helper launch, readiness, and unexpected-exit failures with diagnostics."""
+
+    disk = burn.Disk("disk7", "Micro SD/M2", 32 * 1024**3, "USB", False, True, True)
+    with mock.patch.object(burn, "ensure_same_disk", return_value=disk), mock.patch.object(
+        burn.subprocess, "Popen", side_effect=OSError("launch failed")
+    ), pytest.raises(burn.BurnError, match="Could not start the automatic-mount guard: launch failed"):
+        burn.AutomaticMountGuard(disk).start()
+
+    startup_process = mock.Mock()
+    startup_process.stdout = io.BytesIO(b"")
+    startup_process.poll.return_value = 1
+    startup_process.communicate.return_value = (b"", b"session failed")
+    with mock.patch.object(burn, "ensure_same_disk", return_value=disk), mock.patch.object(
+        burn.subprocess, "Popen", return_value=startup_process
+    ), mock.patch.object(burn.select, "select", return_value=([startup_process.stdout], [], [])), pytest.raises(
+        burn.BurnError,
+        match="Could not initialize the automatic-mount guard for /dev/disk7: session failed",
+    ):
+        burn.AutomaticMountGuard(disk).start()
+
+    runtime_process = mock.Mock()
+    runtime_process.poll.return_value = 9
+    runtime_process.communicate.return_value = (b"", b"callback loop stopped")
+    guard = burn.AutomaticMountGuard(disk)
+    guard.process = runtime_process
+    with pytest.raises(
+        burn.BurnError,
+        match=r"automatic-mount guard for /dev/disk7 stopped unexpectedly \(exit code 9\): callback loop stopped",
+    ):
+        guard.keep_alive()
+    assert guard.process is None
+
+
+def test_automatic_mount_guard_escalates_shutdown_and_reaps_helper():
+    """Kill and reap a helper that ignores the normal termination request."""
+
+    disk = burn.Disk("disk7", "Micro SD/M2", 32 * 1024**3, "USB", False, True, True)
+    process = mock.Mock()
+    process.poll.return_value = None
+    process.communicate.side_effect = [
+        subprocess.TimeoutExpired("mount guard", 3),
+        (b"", b"forced shutdown"),
+    ]
+    guard = burn.AutomaticMountGuard(disk)
+    guard.process = process
+
+    assert guard.stop() == "forced shutdown"
+
+    process.terminate.assert_called_once_with()
+    process.kill.assert_called_once_with()
+    assert process.communicate.call_args_list == [mock.call(timeout=3), mock.call()]
+    assert guard.process is None
 
 
 def test_sudo_session_refreshes_noninteractively_when_due(capsys):
@@ -2943,7 +3080,7 @@ def test_remote_image_preservation_never_falls_back_to_copying(tmp_path):
     assert list((tmp_path / "diagnostics").rglob("ubuntu.img.xz")) == []
 
 
-def test_main_does_not_duplicate_local_image_on_failure(tmp_path, capsys, monkeypatch):
+def test_main_does_not_duplicate_local_image_on_failure(tmp_path, capsys, monkeypatch, automatic_mount_guard):
     """Keep a local image in place and preserve only a report after a run failure."""
 
     image_path = tmp_path / "ubuntu.img"
@@ -3018,7 +3155,9 @@ def test_failure_artifact_destination_error_is_user_facing(tmp_path):
     ("outcome", "keep_on_failure"),
     [("success", False), ("failure", False), ("success", True)],
 )
-def test_main_removes_temporary_image_without_a_preserved_failure(outcome, keep_on_failure, tmp_path, monkeypatch):
+def test_main_removes_temporary_image_without_a_preserved_failure(
+    outcome, keep_on_failure, tmp_path, monkeypatch, automatic_mount_guard
+):
     """Remove a downloaded image after success or an unpreserved failure."""
 
     disk = burn.Disk("disk4", "SD Card", 32 * 1024**3, "USB", False, True, True)
@@ -3093,7 +3232,7 @@ def test_main_removes_temporary_image_without_a_preserved_failure(outcome, keep_
     ids=["error", "cancellation"],
 )
 def test_main_preserves_secret_free_report_after_inventory_failure_or_cancellation(
-    primary_failure, tmp_path, capsys, monkeypatch
+    primary_failure, tmp_path, capsys, monkeypatch, automatic_mount_guard
 ):
     """Preserve the remote image and selected-disk report without leaking configured secrets."""
 
@@ -3303,7 +3442,7 @@ def test_start_number_must_be_positive(value):
         burn.validate_args(args)
 
 
-def test_interactive_start_number_prompt_follows_prefix_and_defaults_to_one(monkeypatch):
+def test_interactive_start_number_prompt_follows_prefix_and_defaults_to_one(monkeypatch, automatic_mount_guard):
     """Prompt for the prefix first, retry the start number, and default it to one."""
 
     disk = burn.Disk("disk4", "SD Card", 32 * 1024**3, "USB", False, True, True)
@@ -3357,7 +3496,9 @@ def test_interactive_start_number_prompt_follows_prefix_and_defaults_to_one(monk
 
 
 @pytest.mark.parametrize("check_cards", [False, True], ids=["unchecked", "checked"])
-def test_noninteractive_flow_can_reuse_same_card_reader(check_cards, tmp_path, capsys, monkeypatch):
+def test_noninteractive_flow_can_reuse_same_card_reader(
+    check_cards, tmp_path, capsys, monkeypatch, automatic_mount_guard
+):
     """Process two cards in one reader with optional checks and one sudo session."""
 
     disk = burn.Disk("disk4", "SD Card", 32 * 1024**3, "USB", False, True, True)
@@ -3374,6 +3515,16 @@ def test_noninteractive_flow_can_reuse_same_card_reader(check_cards, tmp_path, c
         resolved_images.append(image)
         return image
 
+    def record_write(*_args):
+        automatic_mount_guard.append("write")
+        return "b" * 64, 1024
+
+    def record_verification(*_args):
+        automatic_mount_guard.append("verify")
+
+    def record_cloud_init(*_args):
+        automatic_mount_guard.append("cloud-init")
+
     inventory_path = tmp_path / "inventory.ini"
     with mock.patch.object(
         burn, "find_ssh_public_key", return_value=("ssh-ed25519 AAAA test", None)
@@ -3386,11 +3537,11 @@ def test_noninteractive_flow_can_reuse_same_card_reader(check_cards, tmp_path, c
     ), mock.patch.object(burn, "wait_for_disk", wraps=burn.wait_for_disk) as wait_for_disk, mock.patch.object(
         burn, "check_media", return_value=True
     ) as check_media, mock.patch.object(
-        burn, "write_image", return_value=("b" * 64, 1024)
+        burn, "write_image", side_effect=record_write
     ) as write_image, mock.patch.object(
-        burn, "verify_written_image"
+        burn, "verify_written_image", side_effect=record_verification
     ) as verify_image, mock.patch.object(
-        burn, "write_cloud_init"
+        burn, "write_cloud_init", side_effect=record_cloud_init
     ) as cloud_init, mock.patch.object(burn, "eject_disk"):
         arguments = [
                 "--non-interactive",
@@ -3442,6 +3593,11 @@ def test_noninteractive_flow_can_reuse_same_card_reader(check_cards, tmp_path, c
         else:
             check_media.assert_not_called()
             verify_image.assert_not_called()
+    expected_card_events = [("enter", disk, sudo_session), "write"]
+    if check_cards:
+        expected_card_events.append("verify")
+    expected_card_events.extend([("exit", disk, sudo_session), "cloud-init"])
+    assert automatic_mount_guard == expected_card_events * 2
     assert len(downloaded_paths) == 1
     assert not downloaded_paths[0].exists()
     assert "SSH commands:\nssh pomponchik@pi-5.local\nssh pomponchik@pi-6.local\n" in capsys.readouterr().out
@@ -3449,7 +3605,7 @@ def test_noninteractive_flow_can_reuse_same_card_reader(check_cards, tmp_path, c
 
 @pytest.mark.parametrize("selection_mode", ["forced", "interactive"])
 @pytest.mark.parametrize("auth_mode", ["ssh-key", "password"])
-def test_main_uses_one_sudo_session_for_all_cards(auth_mode, selection_mode, monkeypatch):
+def test_main_uses_one_sudo_session_for_all_cards(auth_mode, selection_mode, monkeypatch, automatic_mount_guard):
     """Reuse one sudo session for two cards across selection and login modes."""
 
     first_disk = burn.Disk("disk4", "First SD Card", 32 * 1024**3, "USB", False, True, True)
@@ -3574,7 +3730,7 @@ def test_main_uses_one_sudo_session_for_all_cards(auth_mode, selection_mode, mon
     assert sudo_session.keep_alive.call_count == (2 if selection_mode == "forced" else 0)
 
 
-def test_main_does_not_eject_completed_card_again_when_next_card_wait_fails(monkeypatch):
+def test_main_does_not_eject_completed_card_again_when_next_card_wait_fails(monkeypatch, automatic_mount_guard):
     """Do not re-eject a completed card if authorization fails while awaiting the next card."""
 
     first_disk = burn.Disk("disk4", "First SD Card", 32 * 1024**3, "USB", False, True, True)
@@ -3637,7 +3793,7 @@ def test_main_does_not_eject_completed_card_again_when_next_card_wait_fails(monk
     eject.assert_called_once_with(first_disk)
 
 
-def test_main_does_not_eject_rejected_forced_card_when_reselection_fails(monkeypatch):
+def test_main_does_not_eject_rejected_forced_card_when_reselection_fails(monkeypatch, automatic_mount_guard):
     """Do not eject a rejected forced card if authorization fails during reselection."""
 
     bad_disk = burn.Disk("disk4", "Bad SD Card", 32 * 1024**3, "USB", False, True, True)
@@ -3699,7 +3855,7 @@ def test_main_does_not_eject_rejected_forced_card_when_reselection_fails(monkeyp
 
 @pytest.mark.parametrize("continue_with_failed_card", [True, False], ids=["skip", "back"])
 def test_main_forwards_heartbeat_through_interactive_failed_check_actions(
-    continue_with_failed_card, monkeypatch
+    continue_with_failed_card, monkeypatch, automatic_mount_guard
 ):
     """Forward the sudo heartbeat through card selection and the failed-check prompt for skip and back."""
 
@@ -3754,7 +3910,7 @@ def test_main_forwards_heartbeat_through_interactive_failed_check_actions(
 
 
 @pytest.mark.parametrize("policy", ["abort", "skip"])
-def test_noninteractive_main_honors_failed_check_policy(policy, monkeypatch):
+def test_noninteractive_main_honors_failed_check_policy(policy, monkeypatch, automatic_mount_guard):
     """Abort by default or continue explicitly after a failed non-interactive check."""
 
     disk = burn.Disk("disk4", "SD Card", 32 * 1024**3, "USB", False, True, True)
@@ -3823,7 +3979,7 @@ def test_noninteractive_main_honors_failed_check_policy(policy, monkeypatch):
     ["check", "write", "verify", "interrupt", "cloud-init", "eject", "emergency-eject"],
 )
 def test_main_quietly_ejects_current_card_after_failure_or_cancellation(
-    failure_scenario, capsys, monkeypatch
+    failure_scenario, capsys, monkeypatch, automatic_mount_guard
 ):
     """Attempt quiet ejection after failure without masking the primary exception."""
 
