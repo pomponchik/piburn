@@ -1343,6 +1343,8 @@ def read_disk_block(disk: Disk, block_start: int, length: int, sudo_session: Sud
         raise BurnError("The diagnostic block length is invalid")
     sudo_session.keep_alive()
     ensure_same_disk(disk)
+    unmount_disk(disk)
+    ensure_same_disk(disk)
     process = popen_or_error(
         [
             "sudo",
@@ -1449,6 +1451,8 @@ def verify_written_image(
     try:
         with verified_source_stream(image) as source:
             sudo_session.keep_alive()
+            ensure_same_disk(disk)
+            unmount_disk(disk)
             ensure_same_disk(disk)
             process = popen_or_error(
                 [
@@ -1656,6 +1660,12 @@ def write_image(disk: Disk, image: ImageSpec, sudo_session: SudoSession) -> Tupl
     if process.returncode != 0:
         raise BurnError("dd could not write the image: {}".format(stderr.strip()))
     run(["sync"], capture=False)
+    # Once dd publishes the image's partition table, Disk Arbitration may
+    # automatically mount its FAT boot partition and let macOS services modify
+    # it.  Unmount immediately so post-flash verification observes the bytes
+    # written by dd rather than host-generated filesystem changes.
+    unmount_disk(disk)
+    ensure_same_disk(disk)
     return digest.hexdigest(), written
 
 
