@@ -44,6 +44,7 @@ MIN_CARD_SIZE = 4 * 1024**3
 CHUNK_SIZE = 4 * 1024**2
 INTEGRITY_PATTERN_BLOCK_SIZE = CHUNK_SIZE
 SUDO_REFRESH_INTERVAL = 60.0
+MOUNT_GUARD_READY_TIMEOUT = 10.0
 USER_AGENT = "cluster-burn/1.0"
 PASSWORD_ALPHABET = string.ascii_letters + string.digits
 CRYPT_ALPHABET = "./0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
@@ -123,6 +124,13 @@ class SudoSession:
     def __init__(self, refresh_interval: float = SUDO_REFRESH_INTERVAL) -> None:
         self.refresh_interval = refresh_interval
         self.next_refresh = 0.0
+        self._heartbeats = []  # type: List[Callable[[], None]]
+
+    def add_heartbeat(self, heartbeat: Callable[[], None]) -> None:
+        self._heartbeats.append(heartbeat)
+
+    def remove_heartbeat(self, heartbeat: Callable[[], None]) -> None:
+        self._heartbeats.remove(heartbeat)
 
     def authenticate(self) -> None:
         try:
@@ -132,6 +140,8 @@ class SudoSession:
         self.next_refresh = time.monotonic() + self.refresh_interval
 
     def keep_alive(self) -> None:
+        for heartbeat in tuple(self._heartbeats):
+            heartbeat()
         if time.monotonic() < self.next_refresh:
             return
         try:
@@ -145,6 +155,98 @@ class SudoSession:
             except BurnError as exc:
                 raise SudoError(str(exc)) from exc
         self.next_refresh = time.monotonic() + self.refresh_interval
+
+
+class AutomaticMountGuard:
+    """Keep a separate Disk Arbitration helper alive for one whole disk."""
+
+    def __init__(self, disk: Disk) -> None:
+        self.disk = disk
+        self.process = None  # type: Optional[subprocess.Popen[bytes]]
+
+    def start(self) -> None:
+        ensure_same_disk(self.disk)
+        try:
+            self.process = subprocess.Popen(
+                [sys.executable, "-m", "piburn._mount_guard", self.disk.identifier],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+        except OSError as exc:
+            raise BurnError("Could not start the automatic-mount guard: {}".format(exc))
+        assert self.process.stdout is not None
+        try:
+            readable, _writable, _exceptional = select.select(
+                [self.process.stdout], [], [], MOUNT_GUARD_READY_TIMEOUT
+            )
+            ready_message = self.process.stdout.readline() if readable else b""
+        except OSError as exc:
+            detail = self.stop()
+            raise BurnError(
+                "Could not initialize the automatic-mount guard: {}{}".format(
+                    exc,
+                    ": " + detail if detail else "",
+                )
+            )
+        if ready_message != b"READY\n":
+            detail = self.stop()
+            raise BurnError(
+                "Could not initialize the automatic-mount guard for {}{}".format(
+                    self.disk.device,
+                    ": " + detail if detail else "",
+                )
+            )
+
+    def keep_alive(self) -> None:
+        if self.process is None:
+            raise BurnError("The automatic-mount guard is not running")
+        returncode = self.process.poll()
+        if returncode is None:
+            return
+        _stdout, stderr = self.process.communicate()
+        self.process = None
+        detail = (stderr or b"").decode("utf-8", "replace").strip()
+        raise BurnError(
+            "The automatic-mount guard for {} stopped unexpectedly (exit code {}){}".format(
+                self.disk.device,
+                returncode,
+                ": " + detail if detail else "",
+            )
+        )
+
+    def stop(self) -> str:
+        process = self.process
+        self.process = None
+        if process is None:
+            return ""
+        if process.poll() is None:
+            with contextlib.suppress(ProcessLookupError):
+                process.terminate()
+        try:
+            _stdout, stderr = process.communicate(timeout=3)
+        except subprocess.TimeoutExpired:
+            with contextlib.suppress(ProcessLookupError):
+                process.kill()
+            _stdout, stderr = process.communicate()
+        except OSError as exc:
+            return str(exc)
+        return (stderr or b"").decode("utf-8", "replace").strip()
+
+
+@contextlib.contextmanager
+def prevent_automatic_mounts(disk: Disk, sudo_session: SudoSession) -> Iterator[AutomaticMountGuard]:
+    """Deny automatic mounts while raw image bytes are written and verified."""
+    guard = AutomaticMountGuard(disk)
+    guard.start()
+    sudo_session.add_heartbeat(guard.keep_alive)
+    try:
+        guard.keep_alive()
+        yield guard
+        guard.keep_alive()
+    finally:
+        sudo_session.remove_heartbeat(guard.keep_alive)
+        guard.stop()
 
 
 class TerminalInputParser:
@@ -2111,16 +2213,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     current_disk = None
                     forced_device = None
 
-                image_digest, image_size = write_image(current_disk, image, sudo_session)
-                if check_cards:
-                    print("Verifying the written image...")
-                    verify_written_image(
-                        current_disk,
-                        image,
-                        image_digest,
-                        image_size,
-                        sudo_session,
-                    )
+                with prevent_automatic_mounts(current_disk, sudo_session):
+                    image_digest, image_size = write_image(current_disk, image, sudo_session)
+                    if check_cards:
+                        print("Verifying the written image...")
+                        verify_written_image(
+                            current_disk,
+                            image,
+                            image_digest,
+                            image_size,
+                            sudo_session,
+                        )
                 write_cloud_init(
                     current_disk,
                     hostname,
