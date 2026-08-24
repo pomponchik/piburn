@@ -640,11 +640,15 @@ def test_sudo_session_lifecycle_does_not_start_a_background_thread():
     successful_sudo_result = subprocess.CompletedProcess(["sudo"], 0)
     thread_start = mock.Mock()
     with mock.patch.object(threading.Thread, "start", thread_start), mock.patch.object(
-        threading, "_start_new_thread", thread_start
+        threading, "_start_new_thread", thread_start, create=True
+    ), mock.patch.object(
+        threading, "_start_joinable_thread", thread_start, create=True
     ), mock.patch.object(
         _thread, "start_new_thread", thread_start
     ), mock.patch.object(
         _thread, "start_new", thread_start
+    ), mock.patch.object(
+        _thread, "start_joinable_thread", thread_start, create=True
     ), mock.patch.object(
         burn, "run", return_value=successful_sudo_result
     ) as run, mock.patch.object(
