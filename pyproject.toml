@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "piburn"
-version = "0.0.4"
+version = "0.0.5"
 authors = [{ name = "Evgeniy Blinov", email = "zheni-b@yandex.ru" }]
 description = "Flash ready-to-boot Ubuntu Server microSD cards for Raspberry Pi clusters"
 readme = "README.md"
@@ -44,6 +44,7 @@ piburn = ["py.typed"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "--strict-markers"
+pythonpath = ["."]
 
 [tool.coverage.run]
 branch = true
@@ -61,6 +62,5 @@ line-length = 120
 select = ["E", "F", "I", "W"]
 
 [tool.mypy]
-python_version = "3.8"
 strict = true
 packages = ["piburn"]
