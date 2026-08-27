@@ -23,22 +23,26 @@ def configure_functions(disk_arbitration: Any, core_foundation: Any) -> Any:
         ctypes.c_void_p,
         ctypes.c_void_p,
     ]
+    disk_arbitration.DASessionScheduleWithRunLoop.restype = None
     disk_arbitration.DASessionUnscheduleFromRunLoop.argtypes = [
         ctypes.c_void_p,
         ctypes.c_void_p,
         ctypes.c_void_p,
     ]
+    disk_arbitration.DASessionUnscheduleFromRunLoop.restype = None
     disk_arbitration.DARegisterDiskMountApprovalCallback.argtypes = [
         ctypes.c_void_p,
         ctypes.c_void_p,
         callback_type,
         ctypes.c_void_p,
     ]
+    disk_arbitration.DARegisterDiskMountApprovalCallback.restype = None
     disk_arbitration.DAUnregisterApprovalCallback.argtypes = [
         ctypes.c_void_p,
         callback_type,
         ctypes.c_void_p,
     ]
+    disk_arbitration.DAUnregisterApprovalCallback.restype = None
     disk_arbitration.DADiskCopyWholeDisk.argtypes = [ctypes.c_void_p]
     disk_arbitration.DADiskCopyWholeDisk.restype = ctypes.c_void_p
     disk_arbitration.DADiskGetBSDName.argtypes = [ctypes.c_void_p]
@@ -51,7 +55,9 @@ def configure_functions(disk_arbitration: Any, core_foundation: Any) -> Any:
     core_foundation.CFRunLoopRunInMode.argtypes = [ctypes.c_void_p, ctypes.c_double, ctypes.c_bool]
     core_foundation.CFRunLoopRunInMode.restype = ctypes.c_int32
     core_foundation.CFRunLoopStop.argtypes = [ctypes.c_void_p]
+    core_foundation.CFRunLoopStop.restype = None
     core_foundation.CFRelease.argtypes = [ctypes.c_void_p]
+    core_foundation.CFRelease.restype = None
     return callback_type
 
 

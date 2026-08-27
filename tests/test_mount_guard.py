@@ -7,27 +7,61 @@ import pytest
 from piburn import _mount_guard as mount_guard
 
 
-def test_configure_functions_declares_the_disk_arbitration_abi():
-    """Declare every ctypes argument and result used by the helper callback loop."""
+def test_configure_functions_declares_disk_arbitration_and_core_foundation_abi():
+    """Declare the exact ctypes ABI for every Disk Arbitration and CoreFoundation function used."""
 
     disk_arbitration = mock.Mock()
     core_foundation = mock.Mock()
 
     callback_type = mount_guard.configure_functions(disk_arbitration, core_foundation)
 
+    assert callback_type._argtypes_ == (ctypes.c_void_p, ctypes.c_void_p)
+    assert callback_type._restype_ is ctypes.c_void_p
     assert disk_arbitration.DASessionCreate.argtypes == [ctypes.c_void_p]
     assert disk_arbitration.DASessionCreate.restype is ctypes.c_void_p
+    assert disk_arbitration.DASessionScheduleWithRunLoop.argtypes == [
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+    ]
+    assert disk_arbitration.DASessionScheduleWithRunLoop.restype is None
+    assert disk_arbitration.DASessionUnscheduleFromRunLoop.argtypes == [
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+    ]
+    assert disk_arbitration.DASessionUnscheduleFromRunLoop.restype is None
     assert disk_arbitration.DARegisterDiskMountApprovalCallback.argtypes == [
         ctypes.c_void_p,
         ctypes.c_void_p,
         callback_type,
         ctypes.c_void_p,
     ]
+    assert disk_arbitration.DARegisterDiskMountApprovalCallback.restype is None
+    assert disk_arbitration.DAUnregisterApprovalCallback.argtypes == [
+        ctypes.c_void_p,
+        callback_type,
+        ctypes.c_void_p,
+    ]
+    assert disk_arbitration.DAUnregisterApprovalCallback.restype is None
+    assert disk_arbitration.DADiskCopyWholeDisk.argtypes == [ctypes.c_void_p]
     assert disk_arbitration.DADiskCopyWholeDisk.restype is ctypes.c_void_p
+    assert disk_arbitration.DADiskGetBSDName.argtypes == [ctypes.c_void_p]
     assert disk_arbitration.DADiskGetBSDName.restype is ctypes.c_char_p
-    assert disk_arbitration.DADissenterCreate.argtypes == [ctypes.c_void_p, ctypes.c_int32, ctypes.c_void_p]
+    assert disk_arbitration.DADissenterCreate.argtypes == [
+        ctypes.c_void_p,
+        ctypes.c_int32,
+        ctypes.c_void_p,
+    ]
+    assert disk_arbitration.DADissenterCreate.restype is ctypes.c_void_p
+    assert core_foundation.CFRunLoopGetCurrent.argtypes == []
+    assert core_foundation.CFRunLoopGetCurrent.restype is ctypes.c_void_p
     assert core_foundation.CFRunLoopRunInMode.argtypes == [ctypes.c_void_p, ctypes.c_double, ctypes.c_bool]
     assert core_foundation.CFRunLoopRunInMode.restype is ctypes.c_int32
+    assert core_foundation.CFRunLoopStop.argtypes == [ctypes.c_void_p]
+    assert core_foundation.CFRunLoopStop.restype is None
+    assert core_foundation.CFRelease.argtypes == [ctypes.c_void_p]
+    assert core_foundation.CFRelease.restype is None
 
 
 def test_mount_approval_callback_denies_only_the_selected_whole_disk():
@@ -58,13 +92,31 @@ def test_mount_approval_callback_denies_only_the_selected_whole_disk():
     assert core_foundation.CFRelease.call_args_list == [mock.call(7), mock.call(7), mock.call(4)]
 
 
-def test_run_guard_registers_until_signalled_then_cleans_up(capsys):
-    """Announce readiness only after registration, then unregister and release on termination."""
+def test_run_guard_announces_ready_after_registration_and_cleans_up_on_signal(capsys):
+    """Print a flushed READY after registering the callback and scheduling the session.
 
+    On SIGTERM, unregister the callback, unschedule and release the session,
+    and restore the previous signal handlers.
+    """
+
+    events = []
     disk_arbitration = mock.Mock()
     disk_arbitration.DASessionCreate.return_value = 11
+    disk_arbitration.DARegisterDiskMountApprovalCallback.side_effect = lambda *_args: events.append(
+        "register"
+    )
+    disk_arbitration.DASessionScheduleWithRunLoop.side_effect = lambda *_args: events.append(
+        "schedule"
+    )
+    disk_arbitration.DAUnregisterApprovalCallback.side_effect = lambda *_args: events.append(
+        "unregister"
+    )
+    disk_arbitration.DASessionUnscheduleFromRunLoop.side_effect = lambda *_args: events.append(
+        "unschedule"
+    )
     core_foundation = mock.Mock()
     core_foundation.CFRunLoopGetCurrent.return_value = 22
+    core_foundation.CFRelease.side_effect = lambda *_args: events.append("release")
     ctypes_api = mock.Mock()
     ctypes_api.CDLL.side_effect = [disk_arbitration, core_foundation]
     ctypes_api.c_void_p.in_dll.return_value.value = 33
@@ -72,14 +124,17 @@ def test_run_guard_registers_until_signalled_then_cleans_up(capsys):
     original_handlers = {signal.SIGTERM: object(), signal.SIGINT: object()}
 
     def install_signal_handler(signal_number, handler):
-        previous = signal_handlers.get(signal_number, original_handlers[signal_number])
+        previous_handler = signal_handlers.get(
+            signal_number, original_handlers[signal_number]
+        )
         signal_handlers[signal_number] = handler
-        return previous
+        return previous_handler
 
     signal_api = mock.Mock(SIGTERM=signal.SIGTERM, SIGINT=signal.SIGINT)
     signal_api.signal.side_effect = install_signal_handler
 
     def stop_after_first_iteration(*_args):
+        events.append("run-loop")
         signal_handlers[signal.SIGTERM](signal.SIGTERM, None)
 
     core_foundation.CFRunLoopRunInMode.side_effect = stop_after_first_iteration
@@ -88,10 +143,29 @@ def test_run_guard_registers_until_signalled_then_cleans_up(capsys):
         mount_guard, "signal", signal_api
     ), mock.patch.object(mount_guard, "configure_functions", return_value="callback-type"), mock.patch.object(
         mount_guard, "create_mount_approval_callback", return_value=approval_callback
-    ) as create_callback:
+    ) as create_callback, mock.patch(
+        "builtins.print", side_effect=lambda *_args, **_kwargs: events.append("ready")
+    ) as print_ready:
         assert mount_guard.run_guard("disk7") == 0
 
-    assert capsys.readouterr().out == "READY\n"
+    assert capsys.readouterr().out == ""
+    assert ctypes_api.CDLL.call_args_list == [
+        mock.call(mount_guard.DISK_ARBITRATION_FRAMEWORK),
+        mock.call(mount_guard.CORE_FOUNDATION_FRAMEWORK),
+    ]
+    ctypes_api.c_void_p.in_dll.assert_called_once_with(
+        core_foundation, "kCFRunLoopDefaultMode"
+    )
+    print_ready.assert_called_once_with("READY", flush=True)
+    assert events == [
+        "register",
+        "schedule",
+        "ready",
+        "run-loop",
+        "unregister",
+        "unschedule",
+        "release",
+    ]
     create_callback.assert_called_once_with("disk7", disk_arbitration, core_foundation, "callback-type")
     disk_arbitration.DARegisterDiskMountApprovalCallback.assert_called_once_with(
         11, None, approval_callback, None
