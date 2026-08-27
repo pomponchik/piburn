@@ -19,19 +19,38 @@ from piburn import cli as burn
 
 
 @pytest.fixture
-def automatic_mount_guard(monkeypatch):
-    """Replace the macOS helper with an ordered in-process guard for main tests."""
+def card_operation_events(monkeypatch):
+    """Replace both macOS helpers with in-process guards for main tests."""
     events = []
 
+    class FakeSleepGuard:
+        def __init__(self, sudo_session):
+            self.sudo_session = sudo_session
+            self.committed = False
+
+        def commit(self):
+            self.committed = True
+            events.append(("power-commit", self.sudo_session))
+
     @burn.contextlib.contextmanager
-    def guard(disk, sudo_session):
+    def mount_guard(disk, sudo_session):
         events.append(("enter", disk, sudo_session))
         try:
             yield
         finally:
             events.append(("exit", disk, sudo_session))
 
-    monkeypatch.setattr(burn, "prevent_automatic_mounts", guard)
+    @burn.contextlib.contextmanager
+    def sleep_guard(sudo_session):
+        events.append(("power-enter", sudo_session))
+        try:
+            yield FakeSleepGuard(sudo_session)
+        finally:
+            events.append(("power-exit", sudo_session))
+
+    monkeypatch.setattr(burn, "prevent_automatic_mounts", mount_guard)
+    monkeypatch.setattr(burn, "prevent_system_sleep", sleep_guard)
+    monkeypatch.setattr(burn, "ensure_same_disk", lambda disk: disk)
     return events
 
 
@@ -416,14 +435,199 @@ def test_ensure_same_disk_rejects_changed_fingerprint(field_name, replacement_va
     get_disk.assert_called_once_with("/dev/disk4")
 
 
-def test_unmount_disk_runs_diskutil_for_selected_whole_disk():
-    """Run diskutil unmountDisk on the selected whole disk."""
+def test_unmount_disk_retries_transient_failure_for_same_media():
+    """Retry unmounting when diskutil returns the exact transient-failure diagnostic.
+
+    Wait one second and rerun heartbeat and fingerprint checks between attempts.
+    """
 
     disk = burn.Disk("disk4", "SD Card", 32 * 1024**3, "USB", False, True, True)
-    with mock.patch.object(burn, "run") as run:
+    failed_unmount_result = subprocess.CompletedProcess(
+        [], 1, b"", b"Unmount failed for /dev/disk4"
+    )
+    successful_unmount_result = subprocess.CompletedProcess([], 0, b"", b"")
+    heartbeat = mock.Mock()
+    with mock.patch.object(
+        burn, "ensure_same_disk", return_value=disk
+    ) as ensure_same_disk, mock.patch.object(
+        burn,
+        "run",
+        side_effect=[failed_unmount_result, failed_unmount_result, successful_unmount_result],
+    ) as run, mock.patch.object(burn.time, "sleep") as sleep:
+        burn.unmount_disk(disk, heartbeat=heartbeat)
+
+    assert heartbeat.call_count == 3
+    assert ensure_same_disk.call_args_list == [mock.call(disk)] * 3
+    assert run.call_args_list == [
+        mock.call(["diskutil", "unmountDisk", "/dev/disk4"], check=False)
+    ] * 3
+    assert sleep.call_args_list == [mock.call(1.0), mock.call(1.0)]
+
+
+def test_unmount_disk_rejects_changed_media_before_retry():
+    """Never send a second unmount command after the selected fingerprint changes."""
+
+    disk = burn.Disk("disk4", "SD Card", 32 * 1024**3, "USB", False, True, True)
+    failed_unmount_result = subprocess.CompletedProcess(
+        [], 1, b"", b"Unmount failed for /dev/disk4"
+    )
+    media_change_error = burn.BurnError("media changed")
+    with mock.patch.object(
+        burn, "ensure_same_disk", side_effect=[disk, media_change_error]
+    ), mock.patch.object(
+        burn, "run", return_value=failed_unmount_result
+    ) as run, mock.patch.object(burn.time, "sleep"), pytest.raises(
+        burn.BurnError, match="media changed"
+    ) as raised:
         burn.unmount_disk(disk)
 
-    run.assert_called_once_with(["diskutil", "unmountDisk", "/dev/disk4"])
+    assert raised.value is media_change_error
+    run.assert_called_once_with(["diskutil", "unmountDisk", "/dev/disk4"], check=False)
+
+
+def test_unmount_disk_reports_final_failure_after_retry_budget():
+    """Run every heartbeat and fingerprint check, then report the fifth failure."""
+
+    disk = burn.Disk("disk4", "SD Card", 32 * 1024**3, "USB", False, True, True)
+    heartbeat = mock.Mock()
+    failed_unmount_results = [
+        subprocess.CompletedProcess(
+            [],
+            1,
+            b"",
+            "Unmount failed for /dev/disk4: busy {}".format(attempt_number).encode(),
+        )
+        for attempt_number in range(1, 6)
+    ]
+    with mock.patch.object(
+        burn, "ensure_same_disk", return_value=disk
+    ) as ensure_same_disk, mock.patch.object(
+        burn, "run", side_effect=failed_unmount_results
+    ) as run, mock.patch.object(burn.time, "sleep") as sleep, pytest.raises(
+        burn.BurnError,
+        match="failed after 5 attempts: Unmount failed for /dev/disk4: busy 5",
+    ):
+        burn.unmount_disk(disk, heartbeat=heartbeat)
+
+    assert heartbeat.call_args_list == [mock.call()] * 5
+    assert ensure_same_disk.call_args_list == [mock.call(disk)] * 5
+    assert run.call_args_list == [
+        mock.call(["diskutil", "unmountDisk", "/dev/disk4"], check=False)
+    ] * 5
+    assert sleep.call_args_list == [mock.call(1.0)] * 4
+
+
+@pytest.mark.parametrize(
+    ("run_outcome", "expected_message"),
+    [
+        (
+            subprocess.CompletedProcess([], 1, b"disk is busy", b""),
+            "Command diskutil failed: disk is busy",
+        ),
+        (
+            subprocess.CompletedProcess([], 1, b"", b"Unmount failed for /dev/disk40"),
+            "Command diskutil failed: Unmount failed for /dev/disk40",
+        ),
+        (
+            subprocess.CompletedProcess([], 1, b"", b"Unmount failed for /dev/disk4s1"),
+            "Command diskutil failed: Unmount failed for /dev/disk4s1",
+        ),
+        (burn.BurnError("could not launch diskutil"), None),
+    ],
+    ids=["unrelated-diagnostic", "similar-identifier", "partition", "launch-failure"],
+)
+def test_unmount_disk_does_not_retry_nontransient_failure(run_outcome, expected_message):
+    """Propagate launch failures and nonmatching diskutil diagnostics without retrying."""
+
+    disk = burn.Disk("disk4", "SD Card", 32 * 1024**3, "USB", False, True, True)
+    heartbeat = mock.Mock()
+    with mock.patch.object(
+        burn, "ensure_same_disk", return_value=disk
+    ) as ensure_same_disk, mock.patch.object(
+        burn, "run", side_effect=[run_outcome]
+    ) as run, mock.patch.object(burn.time, "sleep") as delay, pytest.raises(
+        burn.BurnError
+    ) as raised:
+        burn.unmount_disk(disk, heartbeat=heartbeat)
+
+    if isinstance(run_outcome, burn.BurnError):
+        assert raised.value is run_outcome
+    else:
+        assert str(raised.value) == expected_message
+    heartbeat.assert_called_once_with()
+    ensure_same_disk.assert_called_once_with(disk)
+    run.assert_called_once_with(["diskutil", "unmountDisk", "/dev/disk4"], check=False)
+    delay.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("failure_boundary", "expected_events"),
+    [
+        ("first-heartbeat", ["heartbeat"]),
+        ("first-fingerprint", ["heartbeat", "fingerprint"]),
+        ("second-heartbeat", ["heartbeat", "fingerprint", "diskutil", "delay", "heartbeat"]),
+        (
+            "second-fingerprint",
+            ["heartbeat", "fingerprint", "diskutil", "delay", "heartbeat", "fingerprint"],
+        ),
+    ],
+)
+def test_unmount_disk_checks_heartbeat_and_fingerprint_before_each_attempt(
+    failure_boundary, expected_events
+):
+    """Run heartbeat and fingerprint checks before every unmount command.
+
+    If either check fails, do not issue diskutil for that attempt and preserve
+    the exact sleep or media-change error.
+    """
+
+    disk = burn.Disk("disk4", "SD Card", 32 * 1024**3, "USB", False, True, True)
+    failed_unmount_result = subprocess.CompletedProcess(
+        [], 1, b"", b"Unmount failed for /dev/disk4"
+    )
+    boundary_error = (
+        burn.SystemSleepError("forced sleep")
+        if "heartbeat" in failure_boundary
+        else burn.BurnError("media changed")
+    )
+    events = []
+    heartbeat_call_count = 0
+    fingerprint_call_count = 0
+
+    def heartbeat():
+        nonlocal heartbeat_call_count
+        heartbeat_call_count += 1
+        events.append("heartbeat")
+        if failure_boundary == "{}-heartbeat".format(
+            "first" if heartbeat_call_count == 1 else "second"
+        ):
+            raise boundary_error
+
+    def ensure_same_disk(_disk):
+        nonlocal fingerprint_call_count
+        fingerprint_call_count += 1
+        events.append("fingerprint")
+        if failure_boundary == "{}-fingerprint".format(
+            "first" if fingerprint_call_count == 1 else "second"
+        ):
+            raise boundary_error
+        return disk
+
+    def run_unmount(*_args, **_kwargs):
+        events.append("diskutil")
+        return failed_unmount_result
+
+    with mock.patch.object(burn, "ensure_same_disk", side_effect=ensure_same_disk), mock.patch.object(
+        burn, "run", side_effect=run_unmount
+    ), mock.patch.object(
+        burn.time, "sleep", side_effect=lambda _seconds: events.append("delay")
+    ), pytest.raises(
+        type(boundary_error)
+    ) as raised:
+        burn.unmount_disk(disk, heartbeat=heartbeat)
+
+    assert raised.value is boundary_error
+    assert events == expected_events
 
 
 def test_wifi_fallback_scans_available_networks_even_with_saved_names():
@@ -484,6 +688,444 @@ def test_cloud_init_uses_safe_hostname_and_hides_password_from_user_data():
     assert "optional: false" in network
     assert "eth0:" in network
     assert "optional: true" in network
+
+
+def test_find_boot_mount_checks_card_on_every_poll_and_calls_heartbeat_before_return(tmp_path):
+    """Heartbeat and check the fingerprint before mounting and each poll.
+
+    Wait after a miss, then heartbeat again before returning the boot path.
+    """
+
+    disk = burn.Disk("disk4", "SD Card", 32 * 1024**3, "USB", False, True, True)
+    events = []
+    heartbeat = mock.Mock(side_effect=lambda: events.append("heartbeat"))
+    empty_listing = {"AllDisksAndPartitions": [{"Partitions": []}]}
+    mounted_listing = {
+        "AllDisksAndPartitions": [{"Partitions": [{"DeviceIdentifier": "disk4s1"}]}]
+    }
+    listings = iter([empty_listing, mounted_listing])
+
+    def ensure_same_disk(_disk):
+        events.append("fingerprint")
+        return disk
+
+    def run_mount(*_args, **_kwargs):
+        events.append("mount")
+        return subprocess.CompletedProcess([], 0, b"", b"")
+
+    def diskutil_plist(command, device):
+        events.append((command, device))
+        if command == "list":
+            return next(listings)
+        return {
+            "MountPoint": str(tmp_path),
+            "VolumeName": "system-boot",
+            "FilesystemType": "msdos",
+        }
+
+    with mock.patch.object(burn, "ensure_same_disk", side_effect=ensure_same_disk), mock.patch.object(
+        burn, "run", side_effect=run_mount
+    ) as run, mock.patch.object(
+        burn, "diskutil_plist", side_effect=diskutil_plist
+    ), mock.patch.object(
+        burn.time, "monotonic", side_effect=[0.0, 1.0, 2.0]
+    ), mock.patch.object(
+        burn.time, "sleep", side_effect=lambda _seconds: events.append("delay")
+    ) as delay:
+        assert burn.find_boot_mount(disk, heartbeat=heartbeat) == tmp_path
+
+    assert events == [
+        "heartbeat",
+        "fingerprint",
+        "mount",
+        "heartbeat",
+        "fingerprint",
+        ("list", "/dev/disk4"),
+        "delay",
+        "heartbeat",
+        "fingerprint",
+        ("list", "/dev/disk4"),
+        ("info", "/dev/disk4s1"),
+        "heartbeat",
+    ]
+    run.assert_called_once_with(["diskutil", "mountDisk", "/dev/disk4"], check=False)
+    delay.assert_called_once_with(1)
+
+
+@pytest.mark.parametrize(
+    ("failure_boundary", "expected_events"),
+    [
+        ("initial-heartbeat", ["heartbeat"]),
+        ("initial-fingerprint", ["heartbeat", "fingerprint"]),
+        ("poll-heartbeat", ["heartbeat", "fingerprint", "mount", "heartbeat"]),
+        (
+            "poll-fingerprint",
+            ["heartbeat", "fingerprint", "mount", "heartbeat", "fingerprint"],
+        ),
+        (
+            "final-heartbeat",
+            [
+                "heartbeat",
+                "fingerprint",
+                "mount",
+                "heartbeat",
+                "fingerprint",
+                ("list", "/dev/disk4"),
+                ("info", "/dev/disk4s1"),
+                "heartbeat",
+            ],
+        ),
+    ],
+)
+def test_find_boot_mount_stops_at_each_safety_boundary(failure_boundary, expected_events, tmp_path):
+    """Stop at each safety check before performing its protected operation.
+
+    Cover heartbeat and fingerprint failures before mounting and partition
+    listing, plus the final heartbeat before returning the boot path.
+    """
+
+    disk = burn.Disk("disk4", "SD Card", 32 * 1024**3, "USB", False, True, True)
+    boundary_error = (
+        burn.SystemSleepError("forced sleep")
+        if "heartbeat" in failure_boundary
+        else burn.BurnError("media changed")
+    )
+    events = []
+    heartbeat_call_count = 0
+    fingerprint_call_count = 0
+
+    def heartbeat():
+        nonlocal heartbeat_call_count
+        heartbeat_call_count += 1
+        events.append("heartbeat")
+        current_boundary = {1: "initial-heartbeat", 2: "poll-heartbeat", 3: "final-heartbeat"}[
+            heartbeat_call_count
+        ]
+        if failure_boundary == current_boundary:
+            raise boundary_error
+
+    def ensure_same_disk(_disk):
+        nonlocal fingerprint_call_count
+        fingerprint_call_count += 1
+        events.append("fingerprint")
+        current_boundary = (
+            "initial-fingerprint" if fingerprint_call_count == 1 else "poll-fingerprint"
+        )
+        if failure_boundary == current_boundary:
+            raise boundary_error
+        return disk
+
+    def run_mount(*_args, **_kwargs):
+        events.append("mount")
+        return subprocess.CompletedProcess([], 0, b"", b"")
+
+    def diskutil_plist(command, device):
+        events.append((command, device))
+        if command == "list":
+            return {
+                "AllDisksAndPartitions": [{"Partitions": [{"DeviceIdentifier": "disk4s1"}]}]
+            }
+        return {
+            "MountPoint": str(tmp_path),
+            "VolumeName": "system-boot",
+            "FilesystemType": "msdos",
+        }
+
+    with mock.patch.object(burn, "ensure_same_disk", side_effect=ensure_same_disk), mock.patch.object(
+        burn, "run", side_effect=run_mount
+    ), mock.patch.object(burn, "diskutil_plist", side_effect=diskutil_plist), mock.patch.object(
+        burn.time, "monotonic", side_effect=[0.0, 1.0]
+    ), mock.patch.object(burn.time, "sleep") as delay, pytest.raises(type(boundary_error)) as raised:
+        burn.find_boot_mount(disk, heartbeat=heartbeat)
+
+    assert raised.value is boundary_error
+    assert events == expected_events
+    delay.assert_not_called()
+
+
+def test_write_cloud_init_writes_exact_files_with_heartbeats_media_checks_and_sync(tmp_path):
+    """Verify exact cloud-init contents, three fingerprint checks, eight heartbeats, and sync."""
+
+    disk = burn.Disk("disk4", "SD Card", 32 * 1024**3, "USB", False, True, True)
+    heartbeat = mock.Mock()
+    instance_uuid = mock.Mock(hex="c14be458adef488e993497a0d4041a9d")
+    with mock.patch.object(burn.uuid, "uuid4", return_value=instance_uuid), mock.patch.object(
+        burn, "find_boot_mount", return_value=tmp_path
+    ) as find_mount, mock.patch.object(
+        burn, "ensure_same_disk", return_value=disk
+    ) as ensure_same_disk, mock.patch.object(burn, "run") as run:
+        burn.write_cloud_init(
+            disk,
+            "pi-4",
+            "pomponchik",
+            "UTC",
+            "ssh-ed25519 AAAA test",
+            None,
+            "wifi",
+            "secret",
+            heartbeat=heartbeat,
+        )
+
+    find_mount.assert_called_once_with(disk, heartbeat=heartbeat)
+    assert heartbeat.call_count == 8
+    assert ensure_same_disk.call_args_list == [mock.call(disk)] * 3
+    run.assert_called_once_with(["sync"], capture=False)
+    expected_file_contents = {
+        "user-data": (
+            "#cloud-config\n"
+            'hostname: "pi-4"\n'
+            'fqdn: "pi-4.local"\n'
+            "manage_etc_hosts: true\n"
+            'timezone: "UTC"\n'
+            "locale: en_US.UTF-8\n"
+            "users:\n"
+            '  - name: "pomponchik"\n'
+            "    groups: [adm, sudo]\n"
+            "    shell: /bin/bash\n"
+            '    sudo: "ALL=(ALL) NOPASSWD:ALL"\n'
+            "    lock_passwd: true\n"
+            "    ssh_authorized_keys:\n"
+            '      - "ssh-ed25519 AAAA test"\n'
+            "ssh_pwauth: false\n"
+            "disable_root: true\n"
+            "growpart:\n"
+            "  mode: auto\n"
+            "  devices: ['/']\n"
+            "resize_rootfs: true\n"
+            "package_update: true\n"
+            "packages:\n"
+            "  - avahi-daemon\n"
+            "runcmd:\n"
+            "  - [systemctl, enable, --now, avahi-daemon]\n"
+            'final_message: "cluster node pi-4 is ready"\n'
+        ),
+        "network-config": (
+            "version: 2\n"
+            "ethernets:\n"
+            "  eth0:\n"
+            "    dhcp4: true\n"
+            "    optional: true\n"
+            "wifis:\n"
+            "  wlan0:\n"
+            "    dhcp4: true\n"
+            "    optional: false\n"
+            "    access-points:\n"
+            '      "wifi":\n'
+            '        password: "secret"\n'
+        ),
+        "meta-data": (
+            'instance-id: "cluster-pi-4-c14be458adef488e993497a0d4041a9d"\n'
+            'local-hostname: "pi-4"\n'
+        ),
+    }
+    assert {path.name: path.read_text() for path in tmp_path.iterdir()} == expected_file_contents
+
+
+@pytest.mark.parametrize(
+    (
+        "interrupted_heartbeat_number",
+        "expected_filenames",
+        "expected_fingerprint_check_count",
+        "expected_sync_call_count",
+    ),
+    [
+        (1, set(), 0, 0),
+        (2, {"user-data"}, 1, 0),
+        (3, {"user-data"}, 1, 0),
+        (4, {"user-data", "network-config"}, 2, 0),
+        (5, {"user-data", "network-config"}, 2, 0),
+        (6, {"user-data", "network-config", "meta-data"}, 3, 0),
+        (7, {"user-data", "network-config", "meta-data"}, 3, 0),
+        (8, {"user-data", "network-config", "meta-data"}, 3, 1),
+    ],
+    ids=[
+        "before-user-data",
+        "after-user-data",
+        "before-network-config",
+        "after-network-config",
+        "before-meta-data",
+        "after-meta-data",
+        "before-sync",
+        "after-sync",
+    ],
+)
+def test_write_cloud_init_stops_at_each_heartbeat_after_forced_sleep(
+    interrupted_heartbeat_number,
+    expected_filenames,
+    expected_fingerprint_check_count,
+    expected_sync_call_count,
+    tmp_path,
+):
+    """Stop at each forced-sleep boundary without performing the next filesystem action."""
+
+    disk = burn.Disk("disk4", "SD Card", 32 * 1024**3, "USB", False, True, True)
+    sleep_error = burn.SystemSleepError("forced sleep")
+    heartbeat = mock.Mock(
+        side_effect=[None] * (interrupted_heartbeat_number - 1) + [sleep_error]
+    )
+
+    with mock.patch.object(burn, "find_boot_mount", return_value=tmp_path), mock.patch.object(
+        burn, "ensure_same_disk", return_value=disk
+    ) as ensure_same_disk, mock.patch.object(burn, "run") as run, pytest.raises(
+        burn.SystemSleepError
+    ) as raised:
+        burn.write_cloud_init(
+            disk,
+            "pi-4",
+            "pomponchik",
+            "UTC",
+            "ssh-ed25519 AAAA test",
+            None,
+            "wifi",
+            "secret",
+            heartbeat=heartbeat,
+        )
+
+    assert raised.value is sleep_error
+    assert heartbeat.call_count == interrupted_heartbeat_number
+    assert {path.name for path in tmp_path.iterdir()} == expected_filenames
+    assert ensure_same_disk.call_args_list == [
+        mock.call(disk)
+    ] * expected_fingerprint_check_count
+    assert run.call_args_list == [mock.call(["sync"], capture=False)] * expected_sync_call_count
+
+
+@pytest.mark.parametrize(
+    (
+        "failing_fingerprint_call_number",
+        "expected_filenames",
+        "expected_heartbeat_count",
+    ),
+    [
+        (1, set(), 1),
+        (2, {"user-data"}, 3),
+        (3, {"user-data", "network-config"}, 5),
+    ],
+    ids=["user-data", "network-config", "meta-data"],
+)
+def test_write_cloud_init_checks_fingerprint_before_creating_each_file(
+    failing_fingerprint_call_number,
+    expected_filenames,
+    expected_heartbeat_count,
+    tmp_path,
+):
+    """On fingerprint change, stop before creating the next target or temporary file."""
+
+    disk = burn.Disk("disk4", "SD Card", 32 * 1024**3, "USB", False, True, True)
+    fingerprint_error = burn.BurnError("disk fingerprint changed")
+    fingerprint_outcomes = [disk] * (failing_fingerprint_call_number - 1) + [
+        fingerprint_error
+    ]
+    heartbeat = mock.Mock()
+    with mock.patch.object(burn, "find_boot_mount", return_value=tmp_path), mock.patch.object(
+        burn, "ensure_same_disk", side_effect=fingerprint_outcomes
+    ) as ensure_same_disk, mock.patch.object(burn, "run") as run, pytest.raises(
+        burn.BurnError
+    ) as raised:
+        burn.write_cloud_init(
+            disk,
+            "pi-4",
+            "pomponchik",
+            "UTC",
+            "ssh-ed25519 AAAA test",
+            None,
+            "wifi",
+            "secret",
+            heartbeat=heartbeat,
+        )
+
+    assert raised.value is fingerprint_error
+    assert {path.name for path in tmp_path.iterdir()} == expected_filenames
+    assert heartbeat.call_args_list == [mock.call()] * expected_heartbeat_count
+    assert ensure_same_disk.call_args_list == [
+        mock.call(disk)
+    ] * failing_fingerprint_call_number
+    run.assert_not_called()
+
+
+@pytest.mark.parametrize("failing_operation", ["write", "replace"])
+def test_write_cloud_init_prioritizes_sleep_after_filesystem_error(
+    failing_operation, tmp_path
+):
+    """After a cloud-init filesystem error, propagate sleep reported by recovery heartbeat."""
+
+    disk = burn.Disk("disk4", "SD Card", 32 * 1024**3, "USB", False, True, True)
+    sleep_error = burn.SystemSleepError("forced sleep")
+    heartbeat = mock.Mock(side_effect=[None, sleep_error])
+    filesystem_failure_patch = (
+        mock.patch.object(burn.Path, "write_text", side_effect=OSError("write failed"))
+        if failing_operation == "write"
+        else mock.patch.object(burn.os, "replace", side_effect=OSError("replace failed"))
+    )
+
+    with mock.patch.object(burn, "find_boot_mount", return_value=tmp_path), mock.patch.object(
+        burn, "ensure_same_disk", return_value=disk
+    ) as ensure_same_disk, filesystem_failure_patch, mock.patch.object(
+        burn, "run"
+    ) as run, pytest.raises(
+        burn.SystemSleepError
+    ) as raised:
+        burn.write_cloud_init(
+            disk,
+            "pi-4",
+            "pomponchik",
+            "UTC",
+            "ssh-ed25519 AAAA test",
+            None,
+            "wifi",
+            "secret",
+            heartbeat=heartbeat,
+        )
+
+    assert raised.value is sleep_error
+    assert heartbeat.call_args_list == [mock.call(), mock.call()]
+    ensure_same_disk.assert_called_once_with(disk)
+    run.assert_not_called()
+    assert not (tmp_path / "user-data").exists()
+    assert (tmp_path / ".user-data.cluster-burn").exists() is (failing_operation == "replace")
+
+
+@pytest.mark.parametrize("failing_operation", ["write", "replace"])
+def test_write_cloud_init_syncs_and_reports_ordinary_filesystem_error(
+    failing_operation, tmp_path
+):
+    """Without sleep evidence, attempt sync and wrap the cloud-init OSError in BurnError."""
+
+    disk = burn.Disk("disk4", "SD Card", 32 * 1024**3, "USB", False, True, True)
+    heartbeat = mock.Mock()
+    operation_error = OSError("{} failed".format(failing_operation))
+    filesystem_failure_patch = (
+        mock.patch.object(burn.Path, "write_text", side_effect=operation_error)
+        if failing_operation == "write"
+        else mock.patch.object(burn.os, "replace", side_effect=operation_error)
+    )
+
+    with mock.patch.object(burn, "find_boot_mount", return_value=tmp_path), mock.patch.object(
+        burn, "ensure_same_disk", return_value=disk
+    ) as ensure_same_disk, filesystem_failure_patch, mock.patch.object(
+        burn, "run"
+    ) as run, pytest.raises(
+        burn.BurnError
+    ) as raised:
+        burn.write_cloud_init(
+            disk,
+            "pi-4",
+            "pomponchik",
+            "UTC",
+            "ssh-ed25519 AAAA test",
+            None,
+            "wifi",
+            "secret",
+            heartbeat=heartbeat,
+        )
+
+    assert type(raised.value) is burn.BurnError
+    assert str(raised.value) == "Could not write cloud-init files to {}: {} failed".format(
+        tmp_path, failing_operation
+    )
+    assert heartbeat.call_args_list == [mock.call(), mock.call()]
+    ensure_same_disk.assert_called_once_with(disk)
+    run.assert_called_once_with(["sync"], capture=False)
 
 
 def test_password_auth_uses_sha512_crypt_hash():
@@ -685,15 +1327,19 @@ def test_sudo_session_runs_attached_heartbeats_before_sudo_refresh_checks():
 
     session = burn.SudoSession()
     session.next_refresh = 160.0
-    first_heartbeat = mock.Mock()
-    second_heartbeat = mock.Mock()
+    events = []
+    first_heartbeat = mock.Mock(side_effect=lambda: events.append("first"))
+    second_heartbeat = mock.Mock(side_effect=lambda: events.append("second"))
     session.add_heartbeat(first_heartbeat)
     session.add_heartbeat(second_heartbeat)
-    with mock.patch.object(burn, "run") as run, mock.patch.object(burn.time, "monotonic", return_value=100.0):
+    with mock.patch.object(burn, "run") as run, mock.patch.object(
+        burn.time, "monotonic", side_effect=lambda: events.append("clock") or 100.0
+    ):
         session.keep_alive()
         session.remove_heartbeat(first_heartbeat)
         session.keep_alive()
 
+    assert events == ["first", "second", "clock", "second", "clock"]
     assert first_heartbeat.call_args_list == [mock.call()]
     assert second_heartbeat.call_args_list == [mock.call(), mock.call()]
     run.assert_not_called()
@@ -726,21 +1372,65 @@ def test_automatic_mount_guard_starts_exact_helper_and_reaps_it():
     process.communicate.assert_called_once_with(timeout=3)
 
 
-def test_automatic_mount_guard_heartbeat_failure_propagates_and_detaches():
-    """Propagate a dead helper through the sudo heartbeat and detach it after cleanup."""
+@pytest.mark.parametrize(
+    ("failure_boundary", "expected_body_events", "expected_heartbeat_count"),
+    [
+        ("entry", [], 1),
+        ("attached-heartbeat", ["entered"], 2),
+        ("exit-heartbeat", ["entered", "completed"], 3),
+    ],
+)
+def test_prevent_automatic_mounts_propagates_guard_failures_and_detaches_heartbeat(
+    failure_boundary, expected_body_events, expected_heartbeat_count
+):
+    """Propagate helper failures at entry, attached SudoSession heartbeat, or exit.
+
+    After every failure, stop the guard and detach its heartbeat callback.
+    """
 
     disk = burn.Disk("disk7", "Micro SD/M2", 32 * 1024**3, "USB", False, True, True)
     session = burn.SudoSession()
     session.next_refresh = 160.0
     guard = mock.Mock(spec=burn.AutomaticMountGuard)
-    guard.keep_alive.side_effect = [None, burn.BurnError("guard stopped")]
+    guard_error = burn.BurnError("guard stopped at {}".format(failure_boundary))
+    guard.keep_alive.side_effect = [None] * (expected_heartbeat_count - 1) + [guard_error]
+    body_events = []
     with mock.patch.object(burn, "AutomaticMountGuard", return_value=guard), mock.patch.object(
         burn.time, "monotonic", return_value=100.0
-    ), pytest.raises(burn.BurnError, match="guard stopped"):
+    ), pytest.raises(burn.BurnError) as raised:
         with burn.prevent_automatic_mounts(disk, session):
+            body_events.append("entered")
+            if failure_boundary != "entry":
+                session.keep_alive()
+            body_events.append("completed")
+
+    assert raised.value is guard_error
+    assert body_events == expected_body_events
+    guard.start.assert_called_once_with()
+    assert guard.keep_alive.call_args_list == [mock.call()] * expected_heartbeat_count
+    guard.stop.assert_called_once_with()
+    assert session._heartbeats == []
+
+
+def test_prevent_automatic_mounts_detaches_guard_heartbeat_after_successful_lifecycle():
+    """Check the guard at entry, through SudoSession heartbeat, and on exit.
+
+    Then stop the guard and detach its heartbeat callback.
+    """
+
+    disk = burn.Disk("disk7", "Micro SD/M2", 32 * 1024**3, "USB", False, True, True)
+    session = burn.SudoSession()
+    session.next_refresh = 160.0
+    guard = mock.Mock(spec=burn.AutomaticMountGuard)
+    with mock.patch.object(burn, "AutomaticMountGuard", return_value=guard), mock.patch.object(
+        burn.time, "monotonic", return_value=100.0
+    ):
+        with burn.prevent_automatic_mounts(disk, session) as active_guard:
+            assert active_guard is guard
             session.keep_alive()
 
     guard.start.assert_called_once_with()
+    assert guard.keep_alive.call_args_list == [mock.call(), mock.call(), mock.call()]
     guard.stop.assert_called_once_with()
     assert session._heartbeats == []
 
@@ -796,8 +1486,27 @@ def test_automatic_mount_guard_escalates_shutdown_and_reaps_helper():
 
     process.terminate.assert_called_once_with()
     process.kill.assert_called_once_with()
-    assert process.communicate.call_args_list == [mock.call(timeout=3), mock.call()]
+    assert process.communicate.call_args_list == [mock.call(timeout=3), mock.call(timeout=3)]
     assert guard.process is None
+
+
+def test_automatic_mount_guard_reaps_helper_when_startup_is_cancelled():
+    """On Ctrl+C before READY, terminate and reap the Disk Arbitration helper."""
+
+    disk = burn.Disk("disk7", "Micro SD/M2", 32 * 1024**3, "USB", False, True, True)
+    process = mock.Mock()
+    process.stdout = io.BytesIO(b"")
+    process.poll.return_value = None
+    process.communicate.return_value = (b"", b"")
+    with mock.patch.object(burn, "ensure_same_disk", return_value=disk), mock.patch.object(
+        burn.subprocess, "Popen", return_value=process
+    ), mock.patch.object(
+        burn.select, "select", side_effect=KeyboardInterrupt("cancel startup")
+    ), pytest.raises(KeyboardInterrupt, match="cancel startup"):
+        burn.AutomaticMountGuard(disk).start()
+
+    process.terminate.assert_called_once_with()
+    process.communicate.assert_called_once_with(timeout=3)
 
 
 def test_sudo_session_refreshes_noninteractively_when_due(capsys):
@@ -894,23 +1603,26 @@ def test_sudo_session_preserves_deadline_and_raises_sudo_error_when_reauthentica
 
 
 @pytest.mark.parametrize("failing_stage", ["write", "verify"])
-def test_check_media_does_not_report_sudo_failure_as_bad_card(failing_stage, capsys):
-    """Propagate either integrity stage's SudoError without blaming media."""
+@pytest.mark.parametrize("error_type", [burn.SudoError, burn.SystemSleepError])
+def test_check_media_propagates_sudo_or_sleep_without_reporting_bad_card(
+    failing_stage, error_type, capsys
+):
+    """Propagate lost sudo authorization or forced sleep without blaming the card."""
 
     disk = burn.Disk("disk4", "SD Card", 1024, "USB", False, True, True)
     sudo_session = mock.Mock(spec=burn.SudoSession)
-    sudo_error = burn.SudoError("administrator authorization failed")
+    control_error = error_type("control plane failed")
     seed = b"s" * 32
-    write_side_effect = sudo_error if failing_stage == "write" else None
-    verify_side_effect = sudo_error if failing_stage == "verify" else None
+    write_side_effect = control_error if failing_stage == "write" else None
+    verify_side_effect = control_error if failing_stage == "verify" else None
     with mock.patch.object(burn.secrets, "token_bytes", return_value=seed), mock.patch.object(
         burn, "write_integrity_pattern", side_effect=write_side_effect
     ) as write, mock.patch.object(
         burn, "verify_integrity_pattern", side_effect=verify_side_effect
-    ) as verify, pytest.raises(burn.SudoError) as raised:
+    ) as verify, pytest.raises(error_type) as raised:
         burn.check_media(disk, sudo_session)
 
-    assert raised.value is sudo_error
+    assert raised.value is control_error
     sudo_session.authenticate.assert_not_called()
     write.assert_called_once_with(disk, sudo_session, seed)
     if failing_stage == "write":
@@ -923,8 +1635,47 @@ def test_check_media_does_not_report_sudo_failure_as_bad_card(failing_stage, cap
 
 
 @pytest.mark.parametrize("failing_stage", ["write", "verify"])
+def test_check_media_prioritizes_sleep_that_races_with_card_io_failure(failing_stage, capsys):
+    """On integrity I/O failure, propagate the recovery heartbeat's sleep signal.
+
+    Do not report the interrupted card as bad media.
+    """
+
+    disk = burn.Disk("disk4", "SD Card", 1024, "USB", False, True, True)
+    sudo_session = mock.Mock(spec=burn.SudoSession)
+    io_error = burn.BurnError("device disappeared")
+    sleep_error = burn.SystemSleepError("forced sleep")
+    seed = b"s" * 32
+    sudo_session.keep_alive.side_effect = sleep_error
+    write_side_effect = io_error if failing_stage == "write" else None
+    verify_side_effect = io_error if failing_stage == "verify" else None
+    with mock.patch.object(burn.secrets, "token_bytes", return_value=seed), mock.patch.object(
+        burn, "write_integrity_pattern", side_effect=write_side_effect
+    ) as write, mock.patch.object(
+        burn, "verify_integrity_pattern", side_effect=verify_side_effect
+    ) as verify, pytest.raises(
+        burn.SystemSleepError
+    ) as raised:
+        burn.check_media(disk, sudo_session)
+
+    assert raised.value is sleep_error
+    write.assert_called_once_with(disk, sudo_session, seed)
+    if failing_stage == "write":
+        verify.assert_not_called()
+    else:
+        verify.assert_called_once_with(disk, sudo_session, seed)
+    sudo_session.keep_alive.assert_called_once_with()
+    captured = capsys.readouterr()
+    assert captured.out == (
+        "Full write/read integrity test for /dev/disk4 (1.0 KiB). "
+        "All data will be erased; this may take a long time.\n"
+    )
+    assert captured.err == ""
+
+
+@pytest.mark.parametrize("failing_stage", ["write", "verify"])
 def test_check_media_returns_false_and_reports_integrity_errors(failing_stage, capsys):
-    """Return False and report either integrity stage's BurnError, except SudoError."""
+    """Return False and print the card-failure diagnostic for integrity write or read errors."""
 
     disk = burn.Disk("disk4", "SD Card", 1024, "USB", False, True, True)
     sudo_session = mock.Mock(spec=burn.SudoSession)
@@ -975,7 +1726,7 @@ def test_check_media_returns_true_and_reports_success_after_both_stages(capsys):
 
 
 def test_integrity_verifier_rejects_data_written_with_a_different_seed():
-    """Prove that both real integrity stages use their supplied seed."""
+    """Write an integrity pattern with one seed and verify it with another, requiring a mismatch."""
 
     disk = burn.Disk("disk4", "SD Card", 10, "USB", False, True, True)
     write_seed = bytes(range(32))
@@ -1003,7 +1754,7 @@ def test_integrity_verifier_rejects_data_written_with_a_different_seed():
     assert str(raised.value) == "Integrity test data differs at offset 0.0 B"
     assert popen.call_count == 2
     killpg.assert_called_once_with(read_process.pid, burn.signal.SIGTERM)
-    assert read_process.wait_calls == 2
+    assert read_process.wait_calls == 1
 
 
 @pytest.mark.parametrize(
@@ -1110,21 +1861,21 @@ def test_write_all_retries_short_pipe_writes():
 
     class ShortWriter:
         def __init__(self):
-            self.data = bytearray()
-            self.calls = 0
+            self.written_data = bytearray()
+            self.write_call_count = 0
 
         def write(self, data):
-            self.calls += 1
-            accepted = bytes(data[:2])
-            self.data.extend(accepted)
-            return len(accepted)
+            self.write_call_count += 1
+            accepted_chunk = bytes(data[:2])
+            self.written_data.extend(accepted_chunk)
+            return len(accepted_chunk)
 
     stream = ShortWriter()
 
     burn.write_all(stream, b"abcdef")
 
-    assert bytes(stream.data) == b"abcdef"
-    assert stream.calls == 3
+    assert bytes(stream.written_data) == b"abcdef"
+    assert stream.write_call_count == 3
 
 
 @pytest.mark.parametrize(
@@ -1166,19 +1917,20 @@ def test_write_paths_retry_partial_pipe_writes(operation):
     process.input_stream = PartialInput()
     process.stdin = process.input_stream
     sudo_session = mock.Mock(spec=burn.SudoSession)
-    heartbeat_payload_sizes = []
-    progress_payload_sizes = []
-    sudo_session.keep_alive.side_effect = lambda: heartbeat_payload_sizes.append(
+    written_byte_counts_at_heartbeats = []
+    written_byte_counts_at_progress_updates = []
+    sudo_session.keep_alive.side_effect = lambda: written_byte_counts_at_heartbeats.append(
         len(process.input_stream.getvalue())
     )
+
     with mock.patch.object(burn, "CHUNK_SIZE", 4), mock.patch.object(
         burn, "INTEGRITY_PATTERN_BLOCK_SIZE", 4
     ), mock.patch.object(burn, "ensure_same_disk"), mock.patch.object(
-        burn, "unmount_disk"
+        burn, "unmount_disk", side_effect=lambda _disk, heartbeat: heartbeat()
     ), mock.patch.object(burn, "popen_or_error", return_value=process), mock.patch.object(
         burn,
         "show_progress",
-        side_effect=lambda *_args: progress_payload_sizes.append(
+        side_effect=lambda *_args: written_byte_counts_at_progress_updates.append(
             len(process.input_stream.getvalue())
         ),
     ) as progress, mock.patch.object(burn, "run"), mock.patch.object(
@@ -1186,22 +1938,24 @@ def test_write_paths_retry_partial_pipe_writes(operation):
         "verified_source_stream",
         return_value=burn.contextlib.nullcontext(io.BytesIO(data)),
     ):
-        result = run_transfer(operation, disk, image, sudo_session)
-        expected = (
+        transfer_result = run_transfer(operation, disk, image, sudo_session)
+        expected_payload = (
             burn.integrity_pattern(b"s" * 32, 0, len(data))
             if operation == "integrity-write"
             else data
         )
 
-    assert process.input_stream.getvalue() == expected
+    assert process.input_stream.getvalue() == expected_payload
     assert process.input_stream.was_closed is True
-    assert [call.args[1] for call in progress.call_args_list] == [4, 8, 10]
-    assert progress_payload_sizes == [4, 8, 10]
-    assert heartbeat_payload_sizes == [0, 4, 8, 10]
+    assert [progress_call.args[1] for progress_call in progress.call_args_list] == [4, 8, 10]
+    assert written_byte_counts_at_progress_updates == [4, 8, 10]
+    assert written_byte_counts_at_heartbeats == [0, 4, 8, 10] + (
+        [10] if operation == "image-write" else []
+    )
     if operation == "image-write":
-        assert result == (burn.hashlib.sha256(data).hexdigest(), len(data))
+        assert transfer_result == (burn.hashlib.sha256(data).hexdigest(), len(data))
     else:
-        assert result is None
+        assert transfer_result is None
 
 
 def run_transfer(operation, disk, image, sudo_session):
@@ -1227,9 +1981,10 @@ def run_transfer(operation, disk, image, sudo_session):
 
 @pytest.mark.parametrize("operation", ["integrity-write", "integrity-read", "image-write", "image-read"])
 def test_long_transfer_preserves_safety_and_heartbeat_contract(operation):
-    """Check each transfer's exact sudo -n dd command; heartbeat, fingerprint,
-    and unmount order; per-block data, progress, and heartbeats; cleanup; sync;
-    and result.
+    """Verify each transfer's exact sudo dd command and ordered safety and I/O events.
+
+    Also verify its payload, progress, heartbeats, cleanup, sync behavior, and
+    return value.
     """
 
     data = b"abcdefghij"
@@ -1255,7 +2010,9 @@ def test_long_transfer_preserves_safety_and_heartbeat_contract(operation):
     def check_disk(_disk):
         events.append("fingerprint")
 
-    def unmount_card(_disk):
+    def unmount_card(selected_disk, heartbeat):
+        heartbeat()
+        ensure_same_disk(selected_disk)
         events.append("unmount")
 
     def start_dd(*_args, **_kwargs):
@@ -1287,7 +2044,8 @@ def test_long_transfer_preserves_safety_and_heartbeat_contract(operation):
             process.stdout = RecordingOutput(expected_integrity_payload, events)
         transfer_result = run_transfer(operation, disk, image, sudo_session)
 
-    assert sudo_session.keep_alive.call_args_list == [mock.call()] * 4
+    expected_heartbeat_count = 5 if operation == "image-write" else 4
+    assert sudo_session.keep_alive.call_args_list == [mock.call()] * expected_heartbeat_count
     sudo_session.authenticate.assert_not_called()
     expected_events = ["heartbeat", "fingerprint"]
     if is_write or operation == "image-read":
@@ -1296,7 +2054,7 @@ def test_long_transfer_preserves_safety_and_heartbeat_contract(operation):
     if operation == "integrity-write":
         expected_events.append("sync")
     elif operation == "image-write":
-        expected_events.extend(["sync", "unmount", "fingerprint"])
+        expected_events.extend(["sync", "heartbeat", "fingerprint", "unmount", "fingerprint"])
     assert events == expected_events
     progress_label, progress_total = {
         "integrity-write": ("Integrity test write", len(data)),
@@ -1328,15 +2086,18 @@ def test_long_transfer_preserves_safety_and_heartbeat_contract(operation):
     expected_disk_check_count = {
         "integrity-write": 2,
         "integrity-read": 1,
-        "image-write": 3,
+        "image-write": 4,
         "image-read": 2,
     }[operation]
     assert ensure_same_disk.call_args_list == [mock.call(disk)] * expected_disk_check_count
 
     if operation == "image-write":
-        assert unmount.call_args_list == [mock.call(disk), mock.call(disk)]
+        assert unmount.call_args_list == [
+            mock.call(disk, heartbeat=sudo_session.keep_alive),
+            mock.call(disk, heartbeat=sudo_session.keep_alive),
+        ]
     elif operation in ("integrity-write", "image-read"):
-        unmount.assert_called_once_with(disk)
+        unmount.assert_called_once_with(disk, heartbeat=sudo_session.keep_alive)
     else:
         unmount.assert_not_called()
     if is_write:
@@ -1369,10 +2130,16 @@ def test_verify_written_image_uses_image_size_instead_of_full_card_size(byte_lim
     dd_output = requested_data + b"X" * (expected_dd_block_count * 4 - byte_limit)
     process = FakeDDProcess(dd_output)
     sudo_session = mock.Mock(spec=burn.SudoSession)
+
     with mock.patch.object(burn, "CHUNK_SIZE", 4), mock.patch.object(
         burn, "ensure_same_disk"
     ) as ensure_same_disk, mock.patch.object(
-        burn, "unmount_disk"
+        burn,
+        "unmount_disk",
+        side_effect=lambda selected_disk, heartbeat: (
+            heartbeat(),
+            burn.ensure_same_disk(selected_disk),
+        ),
     ) as unmount, mock.patch.object(
         burn, "popen_or_error", return_value=process
     ) as popen, mock.patch.object(burn, "show_progress") as progress, mock.patch.object(
@@ -1380,7 +2147,7 @@ def test_verify_written_image_uses_image_size_instead_of_full_card_size(byte_lim
         "verified_source_stream",
         return_value=burn.contextlib.nullcontext(io.BytesIO(requested_data)),
     ) as source_stream:
-        result = burn.verify_written_image(
+        verification_result = burn.verify_written_image(
             disk,
             burn.ImageSpec(Path("ubuntu.img"), None, "test", uncompressed_size=byte_limit),
             burn.hashlib.sha256(requested_data).hexdigest(),
@@ -1398,10 +2165,10 @@ def test_verify_written_image_uses_image_size_instead_of_full_card_size(byte_lim
         "count={}".format(expected_dd_block_count),
     ]
     assert popen.call_args.args[0] == expected_command
-    assert result is None
+    assert verification_result is None
     assert process.stdout.tell() == byte_limit
     assert ensure_same_disk.call_args_list == [mock.call(disk), mock.call(disk)]
-    unmount.assert_called_once_with(disk)
+    unmount.assert_called_once_with(disk, heartbeat=sudo_session.keep_alive)
     assert sudo_session.keep_alive.call_args_list == [mock.call()] * (expected_dd_block_count + 1)
     sudo_session.authenticate.assert_not_called()
     source_stream.assert_called_once()
@@ -1416,7 +2183,7 @@ def test_verify_written_image_uses_image_size_instead_of_full_card_size(byte_lim
 
 
 def test_verify_written_image_joins_short_source_and_card_reads():
-    """Accept matching non-aligned data when both streams return short reads."""
+    """Accept matching non-block-aligned data when both streams return fragmented reads."""
 
     class FragmentedReader(io.BytesIO):
         def __init__(self, data, fragment_size):
@@ -1433,10 +2200,11 @@ def test_verify_written_image_joins_short_source_and_card_reads():
     disk = burn.Disk("disk4", "SD Card", 32, "USB", False, True, True)
     image = burn.ImageSpec(Path("ubuntu.img"), None, "test", uncompressed_size=len(data))
     sudo_session = mock.Mock(spec=burn.SudoSession)
+
     with mock.patch.object(burn, "CHUNK_SIZE", 4), mock.patch.object(
         burn, "ensure_same_disk"
     ), mock.patch.object(
-        burn, "unmount_disk"
+        burn, "unmount_disk", side_effect=lambda _disk, heartbeat: heartbeat()
     ), mock.patch.object(burn, "popen_or_error", return_value=process), mock.patch.object(
         burn, "show_progress"
     ) as progress, mock.patch.object(
@@ -1444,7 +2212,7 @@ def test_verify_written_image_joins_short_source_and_card_reads():
         "verified_source_stream",
         return_value=burn.contextlib.nullcontext(source),
     ):
-        result = burn.verify_written_image(
+        verification_result = burn.verify_written_image(
             disk,
             image,
             burn.hashlib.sha256(data).hexdigest(),
@@ -1452,10 +2220,10 @@ def test_verify_written_image_joins_short_source_and_card_reads():
             sudo_session,
         )
 
-    assert result is None
+    assert verification_result is None
     assert source.tell() == len(data)
     assert process.stdout.tell() == len(data)
-    assert [call.args[1] for call in progress.call_args_list] == [4, 8, 10]
+    assert [progress_call.args[1] for progress_call in progress.call_args_list] == [4, 8, 10]
     assert sudo_session.keep_alive.call_args_list == [mock.call()] * 4
 
 
@@ -1485,7 +2253,7 @@ def test_verify_written_image_reopens_and_revalidates_source(tmp_path):
     ) as popen, mock.patch.object(
         burn, "show_progress"
     ):
-        result = burn.verify_written_image(
+        verification_result = burn.verify_written_image(
             disk,
             image,
             burn.hashlib.sha256(data).hexdigest(),
@@ -1506,7 +2274,7 @@ def test_verify_written_image_reopens_and_revalidates_source(tmp_path):
                 sudo_session,
             )
 
-    assert result is None
+    assert verification_result is None
     assert process.stdout.tell() == len(data)
     sudo_session.keep_alive.assert_not_called()
     ensure_same_disk.assert_not_called()
@@ -1554,7 +2322,7 @@ def test_verify_written_image_stops_dd_after_decompression_failure(tmp_path):
     )
     popen.assert_called_once()
     killpg.assert_called_once_with(process.pid, burn.signal.SIGTERM)
-    assert process.wait_calls == 2
+    assert process.wait_calls == 1
     assert process.stdout.tell() == len(data)
 
 
@@ -1597,10 +2365,11 @@ def test_verify_written_image_rejects_source_size_changes(
     image = burn.ImageSpec(Path("ubuntu.img"), None, "test", uncompressed_size=4)
     process = FakeDDProcess(b"abcd")
     sudo_session = mock.Mock(spec=burn.SudoSession)
+
     with mock.patch.object(burn, "CHUNK_SIZE", 4), mock.patch.object(
         burn, "ensure_same_disk"
     ), mock.patch.object(
-        burn, "unmount_disk"
+        burn, "unmount_disk", side_effect=lambda _disk, heartbeat: heartbeat()
     ), mock.patch.object(burn, "popen_or_error", return_value=process), mock.patch.object(
         burn, "show_progress"
     ) as progress, mock.patch.object(
@@ -1622,7 +2391,7 @@ def test_verify_written_image_rejects_source_size_changes(
     assert sudo_session.keep_alive.call_args_list == [mock.call()] * expected_heartbeat_count
     assert process.communicate_calls == 0
     killpg.assert_called_once_with(process.pid, burn.signal.SIGTERM)
-    assert process.wait_calls == 2
+    assert process.wait_calls == 1
 
 
 @pytest.mark.parametrize(
@@ -1646,13 +2415,18 @@ def test_read_disk_block_joins_short_reads_with_direct_aligned_dd(
 
     def start_dd(*_args, **_kwargs):
         assert ensure_same_disk.call_args_list == [mock.call(disk), mock.call(disk)]
-        unmount.assert_called_once_with(disk)
+        unmount.assert_called_once_with(disk, heartbeat=sudo_session.keep_alive)
         return process
 
     with mock.patch.object(burn, "CHUNK_SIZE", 4), mock.patch.object(
         burn, "ensure_same_disk"
     ) as ensure_same_disk, mock.patch.object(
-        burn, "unmount_disk"
+        burn,
+        "unmount_disk",
+        side_effect=lambda selected_disk, heartbeat: (
+            heartbeat(),
+            burn.ensure_same_disk(selected_disk),
+        ),
     ) as unmount, mock.patch.object(
         burn, "popen_or_error", side_effect=start_dd
     ) as popen:
@@ -1661,7 +2435,7 @@ def test_read_disk_block_joins_short_reads_with_direct_aligned_dd(
     assert block == expected_block
     sudo_session.keep_alive.assert_called_once_with()
     assert ensure_same_disk.call_args_list == [mock.call(disk), mock.call(disk)]
-    unmount.assert_called_once_with(disk)
+    unmount.assert_called_once_with(disk, heartbeat=sudo_session.keep_alive)
     popen.assert_called_once_with(
         [
             "sudo",
@@ -1714,7 +2488,7 @@ def test_read_disk_block_rejects_invalid_range_before_disk_access(
 
 @pytest.mark.parametrize("failing_check", ["heartbeat", "fingerprint"])
 def test_read_disk_block_propagates_preflight_failure_before_starting_dd(failing_check):
-    """Propagate a sudo or fingerprint failure before diagnostic dd starts."""
+    """Stop before diagnostic dd if the sudo heartbeat or fingerprint check fails."""
 
     disk = burn.Disk("disk4", "SD Card", 32, "USB", False, True, True)
     sudo_session = mock.Mock(spec=burn.SudoSession)
@@ -1726,9 +2500,17 @@ def test_read_disk_block_propagates_preflight_failure_before_starting_dd(failing
     if failing_check == "heartbeat":
         sudo_session.keep_alive.side_effect = preflight_error
     fingerprint_side_effect = preflight_error if failing_check == "fingerprint" else None
+
     with mock.patch.object(burn, "CHUNK_SIZE", 4), mock.patch.object(
         burn, "ensure_same_disk", side_effect=fingerprint_side_effect
-    ) as ensure_same_disk, mock.patch.object(burn, "unmount_disk") as unmount, mock.patch.object(
+    ) as ensure_same_disk, mock.patch.object(
+        burn,
+        "unmount_disk",
+        side_effect=lambda selected_disk, heartbeat: (
+            heartbeat(),
+            burn.ensure_same_disk(selected_disk),
+        ),
+    ) as unmount, mock.patch.object(
         burn, "popen_or_error"
     ) as popen, pytest.raises(
         type(preflight_error)
@@ -1741,7 +2523,7 @@ def test_read_disk_block_propagates_preflight_failure_before_starting_dd(failing
         ensure_same_disk.assert_not_called()
     else:
         ensure_same_disk.assert_called_once_with(disk)
-    unmount.assert_not_called()
+    unmount.assert_called_once_with(disk, heartbeat=sudo_session.keep_alive)
     popen.assert_not_called()
 
 
@@ -1794,7 +2576,7 @@ def test_read_disk_block_stops_dd_after_pipe_failure_or_cancellation(read_error)
         assert type(raised.value) is burn.BurnError
         assert str(raised.value) == "Could not repeat the card read at 4.0 B: pipe failed"
     killpg.assert_called_once_with(process.pid, burn.signal.SIGTERM)
-    assert process.wait_calls == 2
+    assert process.wait_calls == 1
     process.stdout.read.assert_called_once_with(4)
 
 
@@ -1970,7 +2752,7 @@ def test_verify_written_image_reports_exact_first_mismatch(mismatch_offsets):
 
 
 def test_verify_written_image_rejects_changed_source_before_block_diagnostics():
-    """Report a changed source digest without blaming or rereading the card."""
+    """Report a changed source digest without blaming the card or issuing diagnostic rereads."""
 
     source_data = b"changed image"
     disk = burn.Disk("disk4", "SD Card", 32, "USB", False, True, True)
@@ -2054,7 +2836,12 @@ def test_verify_written_image_reports_mismatch_and_changed_source_together():
 
 
 @pytest.mark.parametrize(
-    ("diagnostic_outcomes", "failed_attempt", "successful_attempt", "diagnostic_error"),
+    (
+        "diagnostic_outcomes",
+        "failed_attempt_number",
+        "successful_attempt_number",
+        "diagnostic_error_message",
+    ),
     [
         ([burn.BurnError("first reread failed"), b"Xfgh"], 1, 2, "first reread failed"),
         ([b"Xfgh", burn.BurnError("second reread failed")], 2, 1, "second reread failed"),
@@ -2063,9 +2850,9 @@ def test_verify_written_image_reports_mismatch_and_changed_source_together():
 )
 def test_verification_preserves_mismatch_when_one_diagnostic_read_fails(
     diagnostic_outcomes,
-    failed_attempt,
-    successful_attempt,
-    diagnostic_error,
+    failed_attempt_number,
+    successful_attempt_number,
+    diagnostic_error_message,
 ):
     """Keep the primary mismatch and the successful reread when the other reread fails."""
 
@@ -2107,15 +2894,51 @@ def test_verification_preserves_mismatch_when_one_diagnostic_read_fails(
     assert "Expected block SHA-256: {}.".format(burn.hashlib.sha256(b"efgh").hexdigest()) in message
     assert "Initial card block SHA-256: {}.".format(burn.hashlib.sha256(b"Xfgh").hexdigest()) in message
     assert "Repeated card block {} diagnostic failed: {}.".format(
-        failed_attempt, diagnostic_error
+        failed_attempt_number, diagnostic_error_message
     ) in message
     assert "Repeated card block {} SHA-256: {}.".format(
-        successful_attempt, burn.hashlib.sha256(b"Xfgh").hexdigest()
+        successful_attempt_number, burn.hashlib.sha256(b"Xfgh").hexdigest()
     ) in message
     assert read_block.call_args_list == [
         mock.call(disk, 4, 4, sudo_session),
         mock.call(disk, 4, 4, sudo_session),
     ]
+
+
+@pytest.mark.parametrize("error_type", [burn.SystemSleepError, burn.SudoError])
+def test_verification_diagnostic_reread_propagates_control_plane_failure(error_type):
+    """Never turn forced sleep or lost authorization into a card mismatch diagnostic."""
+
+    source_data = b"abcdefgh"
+    card_data = b"abcdXfgh"
+    disk = burn.Disk("disk4", "SD Card", 32, "USB", False, True, True)
+    image = burn.ImageSpec(Path("ubuntu.img"), None, "test", uncompressed_size=len(source_data))
+    process = FakeDDProcess(card_data)
+    sudo_session = mock.Mock(spec=burn.SudoSession)
+    control_error = error_type("control plane stopped")
+    with mock.patch.object(burn, "CHUNK_SIZE", 4), mock.patch.object(
+        burn, "ensure_same_disk"
+    ), mock.patch.object(
+        burn, "unmount_disk"
+    ), mock.patch.object(burn, "popen_or_error", return_value=process), mock.patch.object(
+        burn, "show_progress"
+    ), mock.patch.object(
+        burn,
+        "verified_source_stream",
+        return_value=burn.contextlib.nullcontext(io.BytesIO(source_data)),
+    ), mock.patch.object(
+        burn, "read_disk_block", side_effect=control_error
+    ) as read_block, pytest.raises(error_type) as raised:
+        burn.verify_written_image(
+            disk,
+            image,
+            burn.hashlib.sha256(source_data).hexdigest(),
+            len(source_data),
+            sudo_session,
+        )
+
+    assert raised.value is control_error
+    read_block.assert_called_once_with(disk, 4, 4, sudo_session)
 
 
 @pytest.mark.parametrize(
@@ -2136,7 +2959,7 @@ def test_verification_preserves_mismatch_when_one_diagnostic_read_fails(
     ],
 )
 def test_transfer_reports_dd_failure(operation, dd_stderr, expected_error_message):
-    """Report dd stderr without fallback and skip sync after failed writes."""
+    """Include dd stderr in the exact operation error and skip sync after failed writes."""
 
     data = b"abcdefghij"
     disk = burn.Disk("disk4", "SD Card", len(data), "USB", False, True, True)
@@ -2154,7 +2977,7 @@ def test_transfer_reports_dd_failure(operation, dd_stderr, expected_error_messag
     with mock.patch.object(burn, "CHUNK_SIZE", 4), mock.patch.object(
         burn, "INTEGRITY_PATTERN_BLOCK_SIZE", 4
     ), mock.patch.object(burn, "ensure_same_disk"), mock.patch.object(
-        burn, "unmount_disk"
+        burn, "unmount_disk", side_effect=lambda _disk, heartbeat: heartbeat()
     ), mock.patch.object(
         burn, "popen_or_error", return_value=process
     ) as popen, mock.patch.object(burn, "show_progress"), mock.patch.object(burn, "run") as run, mock.patch.object(
@@ -2179,13 +3002,16 @@ def test_transfer_reports_dd_failure(operation, dd_stderr, expected_error_messag
 
 @pytest.mark.parametrize("operation", ["integrity-write", "integrity-read", "image-write", "image-read"])
 @pytest.mark.parametrize(
-    "heartbeat_exception_type", [burn.SudoError, KeyboardInterrupt], ids=["sudo", "interrupt"]
+    "heartbeat_exception_type",
+    [burn.SudoError, burn.SystemSleepError, KeyboardInterrupt],
+    ids=["sudo", "system-sleep", "interrupt"],
 )
-def test_transfer_terminates_dd_and_propagates_sudo_failure_or_cancellation(
+def test_transfer_terminates_dd_after_control_plane_failure_or_cancellation(
     operation, heartbeat_exception_type
 ):
-    """Stop after one block, reap dd, and propagate the second heartbeat's SudoError or
-    KeyboardInterrupt unchanged.
+    """Stop and reap dd when sudo, forced sleep, or cancellation interrupts a transfer.
+
+    The exception raised by the second heartbeat must remain unchanged.
     """
 
     data = b"abcdefghij"
@@ -2216,7 +3042,12 @@ def test_transfer_terminates_dd_and_propagates_sudo_failure_or_cancellation(
     with mock.patch.object(burn, "CHUNK_SIZE", 4), mock.patch.object(
         burn, "INTEGRITY_PATTERN_BLOCK_SIZE", 4
     ), mock.patch.object(burn, "ensure_same_disk") as ensure_same_disk, mock.patch.object(
-        burn, "unmount_disk"
+        burn,
+        "unmount_disk",
+        side_effect=lambda selected_disk, heartbeat: (
+            heartbeat(),
+            burn.ensure_same_disk(selected_disk),
+        ),
     ) as unmount, mock.patch.object(
         burn, "popen_or_error", side_effect=start_dd
     ), mock.patch.object(burn, "show_progress"), mock.patch.object(burn, "run") as run, mock.patch.object(
@@ -2235,11 +3066,11 @@ def test_transfer_terminates_dd_and_propagates_sudo_failure_or_cancellation(
     sudo_session.authenticate.assert_not_called()
     assert events == ["heartbeat", "block", "heartbeat"]
     assert process.returncode == -15
-    assert process.wait_calls == (1 if operation == "image-write" else 2)
+    assert process.wait_calls == 1
     run.assert_not_called()
     assert ensure_same_disk.call_count == (1 if operation == "integrity-read" else 2)
     if operation != "integrity-read":
-        unmount.assert_called_once_with(disk)
+        unmount.assert_called_once_with(disk, heartbeat=sudo_session.keep_alive)
     else:
         unmount.assert_not_called()
     if operation.endswith("write"):
@@ -2256,13 +3087,19 @@ def test_transfer_terminates_dd_and_propagates_sudo_failure_or_cancellation(
 
 
 @pytest.mark.parametrize(
-    "heartbeat_exception_type", [burn.SudoError, KeyboardInterrupt], ids=["sudo", "interrupt"]
+    "heartbeat_exception_type",
+    [burn.SudoError, burn.SystemSleepError, KeyboardInterrupt],
+    ids=["sudo", "system-sleep", "interrupt"],
 )
 @pytest.mark.parametrize("close_error_type", [BrokenPipeError, OSError])
-def test_image_write_preserves_sudo_failure_or_cancellation_when_cleanup_fails(
-    heartbeat_exception_type, close_error_type
+@pytest.mark.parametrize("poll_fails", [False, True], ids=["poll-ok", "poll-error"])
+def test_image_write_preserves_control_plane_failure_or_cancellation_when_cleanup_fails(
+    heartbeat_exception_type, close_error_type, poll_fails
 ):
-    """Preserve cancellation or sudo failure when stdin closure and stderr collection fail."""
+    """Preserve the original SudoError, SystemSleepError, or cancellation when cleanup fails.
+
+    Cleanup may fail while polling dd, closing its stdin, or collecting stderr.
+    """
 
     data = b"abcdefghij"
     disk = burn.Disk("disk4", "SD Card", len(data), "USB", False, True, True)
@@ -2274,6 +3111,8 @@ def test_image_write_preserves_sudo_failure_or_cancellation_when_cleanup_fails(
         file_identity=(1, 2, len(data), 3),
     )
     process = FakeDDProcess()
+    if poll_fails:
+        process.poll = mock.Mock(side_effect=OSError("poll failed"))
     process.input_stream.close = mock.Mock(side_effect=close_error_type("close failed"))
     process.communicate = mock.Mock(side_effect=OSError("stderr failed"))
     heartbeat_exception = heartbeat_exception_type("transfer interrupted")
@@ -2282,7 +3121,9 @@ def test_image_write_preserves_sudo_failure_or_cancellation_when_cleanup_fails(
 
     with mock.patch.object(burn, "CHUNK_SIZE", 4), mock.patch.object(
         burn, "ensure_same_disk"
-    ), mock.patch.object(burn, "unmount_disk"), mock.patch.object(
+    ), mock.patch.object(
+        burn, "unmount_disk", side_effect=lambda _disk, heartbeat: heartbeat()
+    ), mock.patch.object(
         burn, "popen_or_error", return_value=process
     ), mock.patch.object(burn, "show_progress"), mock.patch.object(burn, "run") as run, mock.patch.object(
         burn.os, "killpg"
@@ -2314,6 +3155,46 @@ def test_process_stderr_describes_communication_failure():
     process.communicate.assert_called_once_with()
 
 
+def test_terminate_process_group_reports_signal_and_reap_failures(capsys):
+    """Report failures from both termination attempts and the final reap."""
+
+    process = mock.Mock()
+    process.pid = 4321
+    process.poll.return_value = None
+    process.wait.side_effect = [
+        subprocess.TimeoutExpired("dd", 3),
+        subprocess.TimeoutExpired("dd", 3),
+    ]
+    with mock.patch.object(burn.os, "killpg", side_effect=PermissionError("not permitted")):
+        burn.terminate_process_group(process)
+
+    assert process.wait.call_args_list == [mock.call(timeout=3), mock.call(timeout=3)]
+    warning_output = capsys.readouterr().err
+    assert "could not terminate dd process group" in warning_output
+    assert "could not kill dd process group" in warning_output
+    assert "could not reap dd after kill" in warning_output
+
+
+def test_terminate_process_group_reports_poll_and_graceful_wait_failures_while_escalating(capsys):
+    """Poll and graceful-wait errors still lead to bounded SIGTERM, SIGKILL, and reap attempts."""
+
+    process = mock.Mock()
+    process.pid = 4321
+    process.poll.side_effect = OSError("poll failed")
+    process.wait.side_effect = [OSError("graceful wait failed"), 0]
+    with mock.patch.object(burn.os, "killpg") as killpg:
+        burn.terminate_process_group(process)
+
+    assert killpg.call_args_list == [
+        mock.call(process.pid, burn.signal.SIGTERM),
+        mock.call(process.pid, burn.signal.SIGKILL),
+    ]
+    assert process.wait.call_args_list == [mock.call(timeout=3), mock.call(timeout=3)]
+    warning_output = capsys.readouterr().err
+    assert "could not inspect dd: poll failed" in warning_output
+    assert "could not reap dd after termination: graceful wait failed" in warning_output
+
+
 @pytest.mark.parametrize(
     ("operation", "expected_error_message"),
     [
@@ -2324,7 +3205,7 @@ def test_process_stderr_describes_communication_failure():
     ],
 )
 def test_transfer_pipe_error_stops_dd_and_reports_io_failure(operation, expected_error_message):
-    """Stop dd and wrap a pipe OSError after one block in the operation-specific BurnError."""
+    """After one block, stop dd and wrap the pipe OSError in the operation-specific BurnError."""
 
     chunk_size = 4
 
@@ -2361,7 +3242,7 @@ def test_transfer_pipe_error_stops_dd_and_reports_io_failure(operation, expected
     with mock.patch.object(burn, "CHUNK_SIZE", chunk_size), mock.patch.object(
         burn, "INTEGRITY_PATTERN_BLOCK_SIZE", chunk_size
     ), mock.patch.object(burn, "ensure_same_disk"), mock.patch.object(
-        burn, "unmount_disk"
+        burn, "unmount_disk", side_effect=lambda _disk, heartbeat: heartbeat()
     ), mock.patch.object(
         burn, "popen_or_error", return_value=process
     ), mock.patch.object(burn, "show_progress"), mock.patch.object(burn, "run") as run, mock.patch.object(
@@ -2376,7 +3257,7 @@ def test_transfer_pipe_error_stops_dd_and_reports_io_failure(operation, expected
     assert type(raised.value) is burn.BurnError
     assert str(raised.value) == expected_error_message
     killpg.assert_called_once_with(process.pid, burn.signal.SIGTERM)
-    assert process.wait_calls == (1 if operation == "image-write" else 2)
+    assert process.wait_calls == 1
     assert process.communicate_calls == (1 if operation == "image-write" else 0)
     assert sudo_session.keep_alive.call_args_list == [mock.call(), mock.call()]
     sudo_session.authenticate.assert_not_called()
@@ -2433,9 +3314,12 @@ def test_write_image_stops_when_source_size_changes(
     )
     process = FakeDDProcess()
     sudo_session = mock.Mock(spec=burn.SudoSession)
+
     with mock.patch.object(burn, "CHUNK_SIZE", 4), mock.patch.object(
         burn, "ensure_same_disk"
-    ), mock.patch.object(burn, "unmount_disk"), mock.patch.object(
+    ), mock.patch.object(
+        burn, "unmount_disk", side_effect=lambda _disk, heartbeat: heartbeat()
+    ), mock.patch.object(
         burn, "popen_or_error", return_value=process
     ), mock.patch.object(burn, "show_progress"), mock.patch.object(burn, "run") as run, mock.patch.object(
         burn.os, "killpg"
@@ -2460,8 +3344,11 @@ def test_write_image_stops_when_source_size_changes(
 
 
 @pytest.mark.parametrize("operation", ["integrity-write", "integrity-read", "image-write", "image-read"])
-def test_transfer_validates_sudo_before_disk_operations(operation):
-    """Abort before fingerprint checks, unmounting, or dd if sudo is unavailable."""
+def test_transfer_initial_heartbeat_stops_before_fingerprint_diskutil_or_dd(operation):
+    """An initial heartbeat failure prevents fingerprint, diskutil, and dd.
+
+    The heartbeat may run directly or from within unmount.
+    """
 
     data = b"abcdefghij"
     disk = burn.Disk("disk4", "SD Card", len(data), "USB", False, True, True)
@@ -2474,9 +3361,17 @@ def test_transfer_validates_sudo_before_disk_operations(operation):
     )
     sudo_session = mock.Mock(spec=burn.SudoSession)
     sudo_session.keep_alive.side_effect = burn.SudoError("sudo authorization failed")
+
+    def unmount_card(selected_disk, heartbeat):
+        heartbeat()
+        ensure_same_disk(selected_disk)
+        diskutil(["diskutil", "unmountDisk", selected_disk.device], check=False)
+
     with mock.patch.object(burn, "ensure_same_disk") as ensure_same_disk, mock.patch.object(
-        burn, "unmount_disk"
-    ) as unmount, mock.patch.object(burn, "popen_or_error") as popen, mock.patch.object(
+        burn, "unmount_disk", side_effect=unmount_card
+    ) as unmount, mock.patch.object(burn, "run") as diskutil, mock.patch.object(
+        burn, "popen_or_error"
+    ) as popen, mock.patch.object(
         burn,
         "verified_source_stream",
         return_value=burn.contextlib.nullcontext(io.BytesIO(data)),
@@ -2486,7 +3381,11 @@ def test_transfer_validates_sudo_before_disk_operations(operation):
     sudo_session.keep_alive.assert_called_once_with()
     sudo_session.authenticate.assert_not_called()
     ensure_same_disk.assert_not_called()
-    unmount.assert_not_called()
+    diskutil.assert_not_called()
+    if operation == "integrity-read":
+        unmount.assert_not_called()
+    else:
+        unmount.assert_called_once_with(disk, heartbeat=sudo_session.keep_alive)
     popen.assert_not_called()
     if operation.startswith("image-"):
         source_stream.assert_called_once_with(image)
@@ -2513,9 +3412,9 @@ def test_verify_integrity_pattern_joins_short_pipe_reads():
         burn, "popen_or_error", return_value=process
     ), mock.patch.object(burn, "show_progress"):
         process.stdout = FragmentedReader(burn.integrity_pattern(seed, 0, disk.size))
-        result = burn.verify_integrity_pattern(disk, sudo_session, seed)
+        verification_result = burn.verify_integrity_pattern(disk, sudo_session, seed)
 
-    assert result is None
+    assert verification_result is None
     assert process.stdout.tell() == disk.size
     assert sudo_session.keep_alive.call_args_list == [mock.call()] * 4
 
@@ -2560,7 +3459,7 @@ def test_verify_integrity_pattern_rejects_corrupted_data(
     assert type(raised.value) is burn.BurnError
     assert str(raised.value) == expected_error_message
     killpg.assert_called_once_with(process.pid, burn.signal.SIGTERM)
-    assert process.wait_calls == 2
+    assert process.wait_calls == 1
     assert process.stdout.tell() == expected_bytes_read
     assert sudo_session.keep_alive.call_args_list == [mock.call()] * expected_heartbeat_count
     sudo_session.authenticate.assert_not_called()
@@ -2571,15 +3470,16 @@ def test_verify_integrity_pattern_rejects_corrupted_data(
     [("integrity-read", None, 4), ("image-read", b"abcdef", 6)],
 )
 def test_disk_read_rejects_truncated_stream(operation, card_data, expected_bytes_read):
-    """Reject successful dd output shorter than requested."""
+    """Reject a successful but truncated dd stream during integrity or image verification."""
 
     disk = burn.Disk("disk4", "SD Card", 8, "USB", False, True, True)
     process = FakeDDProcess()
     sudo_session = mock.Mock(spec=burn.SudoSession)
+
     with mock.patch.object(burn, "CHUNK_SIZE", 4), mock.patch.object(
         burn, "INTEGRITY_PATTERN_BLOCK_SIZE", 4
     ), mock.patch.object(burn, "ensure_same_disk"), mock.patch.object(
-        burn, "unmount_disk"
+        burn, "unmount_disk", side_effect=lambda _disk, heartbeat: heartbeat()
     ), mock.patch.object(
         burn, "popen_or_error", return_value=process
     ), mock.patch.object(burn, "show_progress"), mock.patch.object(
@@ -2636,11 +3536,9 @@ def test_terminate_process_group_escalates_to_sigkill():
             events.append(("poll",))
             return None
 
-        def wait(self, timeout=None):
+        def wait(self, timeout):
             events.append(("wait", timeout))
-            if timeout is not None:
-                raise subprocess.TimeoutExpired("dd", timeout)
-            return -9
+            raise subprocess.TimeoutExpired("dd", timeout)
 
     process = StubbornProcess()
 
@@ -2655,13 +3553,13 @@ def test_terminate_process_group_escalates_to_sigkill():
         ("signal", process.pid, burn.signal.SIGTERM),
         ("wait", 3),
         ("signal", process.pid, burn.signal.SIGKILL),
-        ("wait", None),
+        ("wait", 3),
     ]
 
 
 @pytest.mark.parametrize("undeliverable_signal", [burn.signal.SIGTERM, burn.signal.SIGKILL])
 def test_terminate_process_group_tolerates_disappearing_group(undeliverable_signal):
-    """Reap the process if its group disappears before SIGTERM or SIGKILL."""
+    """Ignore a vanished process group and still attempt a bounded wait after either signal."""
 
     events = []
 
@@ -2672,9 +3570,9 @@ def test_terminate_process_group_tolerates_disappearing_group(undeliverable_sign
             events.append(("poll",))
             return None
 
-        def wait(self, timeout=None):
+        def wait(self, timeout):
             events.append(("wait", timeout))
-            if undeliverable_signal == burn.signal.SIGKILL and timeout is not None:
+            if undeliverable_signal == burn.signal.SIGKILL:
                 raise subprocess.TimeoutExpired("dd", timeout)
             return 0
 
@@ -2697,7 +3595,7 @@ def test_terminate_process_group_tolerates_disappearing_group(undeliverable_sign
         expected_events.extend(
             [
                 ("signal", process.pid, burn.signal.SIGKILL),
-                ("wait", None),
+                ("wait", 3),
             ]
         )
     assert events == expected_events
@@ -2827,11 +3725,14 @@ def test_broken_dd_pipe_cleans_up_and_reports_diagnostic(
     source_context = burn.contextlib.nullcontext(io.BytesIO(b"data"))
     sudo_session = mock.Mock(spec=burn.SudoSession)
     process = FailedProcess()
+
     with mock.patch.object(
         burn, "verified_source_stream", return_value=source_context
     ), mock.patch.object(
         burn, "ensure_same_disk"
-    ), mock.patch.object(burn, "unmount_disk"), mock.patch.object(
+    ), mock.patch.object(
+        burn, "unmount_disk", side_effect=lambda _disk, heartbeat: heartbeat()
+    ), mock.patch.object(
         burn, "popen_or_error", return_value=process
     ) as popen, mock.patch.object(burn.os, "killpg") as killpg, mock.patch.object(
         burn, "run"
@@ -3084,7 +3985,7 @@ def test_remote_image_preservation_never_falls_back_to_copying(tmp_path):
     assert list((tmp_path / "diagnostics").rglob("ubuntu.img.xz")) == []
 
 
-def test_main_does_not_duplicate_local_image_on_failure(tmp_path, capsys, monkeypatch, automatic_mount_guard):
+def test_main_does_not_duplicate_local_image_on_failure(tmp_path, capsys, monkeypatch):
     """Keep a local image in place and preserve only a report after a run failure."""
 
     image_path = tmp_path / "ubuntu.img"
@@ -3159,10 +4060,10 @@ def test_failure_artifact_destination_error_is_user_facing(tmp_path):
     ("outcome", "keep_on_failure"),
     [("success", False), ("failure", False), ("success", True)],
 )
-def test_main_removes_temporary_image_without_a_preserved_failure(
-    outcome, keep_on_failure, tmp_path, monkeypatch, automatic_mount_guard
+def test_main_removes_temporary_image_when_no_failure_artifacts_are_preserved(
+    outcome, keep_on_failure, tmp_path, monkeypatch, card_operation_events
 ):
-    """Remove a downloaded image after success or an unpreserved failure."""
+    """Remove the image after success or a failure not selected for artifact preservation."""
 
     disk = burn.Disk("disk4", "SD Card", 32 * 1024**3, "USB", False, True, True)
     sudo_session = mock.Mock(spec=burn.SudoSession)
@@ -3199,19 +4100,19 @@ def test_main_removes_temporary_image_without_a_preserved_failure(
     ]
     if keep_on_failure:
         arguments.extend(["--keep-image-on-failure", str(tmp_path / "diagnostics")])
-    write_result = ("b" * 64, 1024)
+    write_outcome = ("b" * 64, 1024)
     if outcome == "failure":
-        write_result = burn.BurnError("write failed")
+        write_outcome = burn.BurnError("write failed")
     monkeypatch.setenv("WIFI", "wifi-secret")
     with mock.patch.object(
         burn, "find_ssh_public_key", return_value=("ssh-ed25519 AAAA test", None)
     ), mock.patch.object(burn, "resolve_image", side_effect=resolve_remote), mock.patch.object(
         burn, "ensure_sudo", return_value=sudo_session
     ), mock.patch.object(burn, "wait_for_disk", return_value=disk), mock.patch.object(
-        burn, "write_image", side_effect=[write_result]
+        burn, "write_image", side_effect=[write_outcome]
     ), mock.patch.object(burn, "write_cloud_init"), mock.patch.object(
         burn, "eject_disk"
-    ), mock.patch.object(burn, "preserve_failure_artifacts") as preserve:
+    ), mock.patch.object(burn, "preserve_failure_artifacts") as preserve_artifacts:
         if outcome == "failure":
             with pytest.raises(burn.BurnError, match="write failed"):
                 burn.main(arguments)
@@ -3220,7 +4121,7 @@ def test_main_removes_temporary_image_without_a_preserved_failure(
 
     assert len(downloaded_paths) == 1
     assert downloaded_paths[0].exists() is False
-    preserve.assert_not_called()
+    preserve_artifacts.assert_not_called()
     diagnostics = tmp_path / "diagnostics"
     if keep_on_failure:
         assert diagnostics.is_dir()
@@ -3235,8 +4136,8 @@ def test_main_removes_temporary_image_without_a_preserved_failure(
     [burn.BurnError("inventory write failed"), KeyboardInterrupt("inventory cancelled")],
     ids=["error", "cancellation"],
 )
-def test_main_preserves_secret_free_report_after_inventory_failure_or_cancellation(
-    primary_failure, tmp_path, capsys, monkeypatch, automatic_mount_guard
+def test_main_preserves_remote_image_and_secret_free_report_after_inventory_failure_or_cancellation(
+    primary_failure, tmp_path, capsys, monkeypatch, card_operation_events
 ):
     """Preserve the remote image and selected-disk report without leaking configured secrets."""
 
@@ -3353,7 +4254,7 @@ def test_artifact_preservation_failure_does_not_mask_primary_error(
         burn,
         "preserve_failure_artifacts",
         side_effect=preservation_error,
-    ) as preserve, pytest.raises(burn.SudoError) as raised:
+    ) as preserve_artifacts, pytest.raises(burn.SudoError) as raised:
         burn.main(
             [
                 "--non-interactive",
@@ -3378,7 +4279,7 @@ def test_artifact_preservation_failure_does_not_mask_primary_error(
         )
 
     assert raised.value is primary_error
-    preserve.assert_called_once_with(tmp_path, image, 1024, None, primary_error)
+    preserve_artifacts.assert_called_once_with(tmp_path, image, 1024, None, primary_error)
     assert capsys.readouterr().err == "Warning: {}\n".format(preservation_error)
 
 
@@ -3406,7 +4307,7 @@ def test_artifact_staging_failure_does_not_mask_primary_error(tmp_path, capsys, 
         burn, "find_ssh_public_key", return_value=("ssh-ed25519 AAAA test", None)
     ), mock.patch.object(burn, "resolve_image", side_effect=resolve_remote), mock.patch.object(
         burn, "ensure_sudo", side_effect=primary_error
-    ), mock.patch.object(burn, "preserve_failure_artifacts") as preserve, pytest.raises(
+    ), mock.patch.object(burn, "preserve_failure_artifacts") as preserve_artifacts, pytest.raises(
         burn.SudoError
     ) as raised:
         burn.main(
@@ -3435,7 +4336,7 @@ def test_artifact_staging_failure_does_not_mask_primary_error(tmp_path, capsys, 
     assert raised.value is primary_error
     assert len(downloaded_paths) == 1
     assert downloaded_paths[0].exists() is False
-    preserve.assert_not_called()
+    preserve_artifacts.assert_not_called()
     assert "Warning: could not prepare failure artifacts:" in capsys.readouterr().err
 
 
@@ -3446,7 +4347,7 @@ def test_start_number_must_be_positive(value):
         burn.validate_args(args)
 
 
-def test_interactive_start_number_prompt_follows_prefix_and_defaults_to_one(monkeypatch, automatic_mount_guard):
+def test_interactive_start_number_prompt_follows_prefix_and_defaults_to_one(monkeypatch, card_operation_events):
     """Prompt for the prefix first, retry the start number, and default it to one."""
 
     disk = burn.Disk("disk4", "SD Card", 32 * 1024**3, "USB", False, True, True)
@@ -3500,16 +4401,33 @@ def test_interactive_start_number_prompt_follows_prefix_and_defaults_to_one(monk
 
 
 @pytest.mark.parametrize("check_cards", [False, True], ids=["unchecked", "checked"])
-def test_noninteractive_flow_can_reuse_same_card_reader(
-    check_cards, tmp_path, capsys, monkeypatch, automatic_mount_guard
+def test_noninteractive_flow_recovers_from_forced_sleep_and_reuses_card_reader(
+    check_cards, tmp_path, capsys, monkeypatch, card_operation_events
 ):
-    """Process two cards in one reader with optional checks and one sudo session."""
+    """Retry the first card after forced sleep, then reuse its reader for a second card."""
 
-    disk = burn.Disk("disk4", "SD Card", 32 * 1024**3, "USB", False, True, True)
+    first_disk = burn.Disk(
+        "disk4",
+        "First SD Card",
+        32 * 1024**3,
+        "USB",
+        False,
+        True,
+        True,
+        "IODeviceTree:/reader/first-card",
+        "FIRST-UUID",
+    )
+    second_disk = dataclasses.replace(
+        first_disk,
+        name="Second SD Card",
+        device_tree_path="IODeviceTree:/reader/second-card",
+        media_uuid="SECOND-UUID",
+    )
     downloaded_paths = []
     resolved_images = []
     sudo_session = mock.Mock(spec=burn.SudoSession)
     monkeypatch.setenv("WIFI", "secret")
+    write_attempt_number = 0
 
     def fake_resolve(_image, _sha256, download_dir):
         path = download_dir / "ubuntu.img.xz"
@@ -3520,14 +4438,18 @@ def test_noninteractive_flow_can_reuse_same_card_reader(
         return image
 
     def record_write(*_args):
-        automatic_mount_guard.append("write")
+        nonlocal write_attempt_number
+        write_attempt_number += 1
+        card_operation_events.append("write")
+        if write_attempt_number == 1:
+            raise burn.SystemSleepError("forced sleep in first card attempt")
         return "b" * 64, 1024
 
     def record_verification(*_args):
-        automatic_mount_guard.append("verify")
+        card_operation_events.append("verify")
 
-    def record_cloud_init(*_args):
-        automatic_mount_guard.append("cloud-init")
+    def record_cloud_init(*_args, **_kwargs):
+        card_operation_events.append("cloud-init")
 
     inventory_path = tmp_path / "inventory.ini"
     with mock.patch.object(
@@ -3537,8 +4459,12 @@ def test_noninteractive_flow_can_reuse_same_card_reader(
         "resolve_image",
         side_effect=fake_resolve,
     ), mock.patch.object(burn, "ensure_sudo", return_value=sudo_session) as ensure_sudo, mock.patch.object(
-        burn, "get_disk", return_value=disk
-    ), mock.patch.object(burn, "wait_for_disk", wraps=burn.wait_for_disk) as wait_for_disk, mock.patch.object(
+        burn, "get_disk", side_effect=[first_disk, first_disk, second_disk]
+    ) as get_disk, mock.patch.object(
+        burn, "wait_for_disk", wraps=burn.wait_for_disk
+    ) as wait_for_disk, mock.patch.object(
+        burn, "wait_for_same_disk", wraps=burn.wait_for_same_disk
+    ) as wait_for_same_disk, mock.patch.object(
         burn, "check_media", return_value=True
     ) as check_media, mock.patch.object(
         burn, "write_image", side_effect=record_write
@@ -3546,34 +4472,33 @@ def test_noninteractive_flow_can_reuse_same_card_reader(
         burn, "verify_written_image", side_effect=record_verification
     ) as verify_image, mock.patch.object(
         burn, "write_cloud_init", side_effect=record_cloud_init
-    ) as cloud_init, mock.patch.object(burn, "eject_disk"):
+    ) as cloud_init, mock.patch.object(burn, "eject_disk") as eject:
         arguments = [
-                "--non-interactive",
-                "--count",
-                "2",
-                "--check" if check_cards else "--no-check",
-                "--ssid",
-                "wifi",
-                "--wifi-password-env",
-                "WIFI",
-                "--prefix",
-                "pi",
-                "--start-number",
-                "5",
-                "--auth-mode",
-                "ssh-key",
-                "--device",
-                "/dev/disk4",
-                "--device",
-                "/dev/disk4",
-                "--inventory",
-                "--inventory-path",
-                str(inventory_path),
-                "--yes",
-            ]
+            "--non-interactive",
+            "--count",
+            "2",
+            "--check" if check_cards else "--no-check",
+            "--ssid",
+            "wifi",
+            "--wifi-password-env",
+            "WIFI",
+            "--prefix",
+            "pi",
+            "--start-number",
+            "5",
+            "--auth-mode",
+            "ssh-key",
+            "--device",
+            "/dev/disk4",
+            "--device",
+            "/dev/disk4",
+            "--inventory",
+            "--inventory-path",
+            str(inventory_path),
+            "--yes",
+        ]
         exit_code = burn.main(arguments)
         assert exit_code == 0
-        assert cloud_init.call_count == 2
         inventory_text = inventory_path.read_text()
         assert "pi-5.local" in inventory_text
         assert "pi-6.local" in inventory_text
@@ -3584,33 +4509,89 @@ def test_noninteractive_flow_can_reuse_same_card_reader(
             mock.call("/dev/disk4", heartbeat=sudo_session.keep_alive),
             mock.call("/dev/disk4", heartbeat=sudo_session.keep_alive),
         ]
-        assert [write_call.args[2] for write_call in write_image.call_args_list] == [
-            sudo_session,
-            sudo_session,
+        wait_for_same_disk.assert_called_once_with(first_disk, heartbeat=sudo_session.keep_alive)
+        assert get_disk.call_args_list == [mock.call("/dev/disk4")] * 3
+        assert [write_call.args[0] for write_call in write_image.call_args_list] == [
+            first_disk,
+            first_disk,
+            second_disk,
         ]
+        assert [write_call.args[2] for write_call in write_image.call_args_list] == [
+            sudo_session
+        ] * 3
         if check_cards:
-            assert check_media.call_args_list == [mock.call(disk, sudo_session)] * 2
+            assert check_media.call_args_list == [
+                mock.call(first_disk, sudo_session),
+                mock.call(second_disk, sudo_session),
+            ]
             assert verify_image.call_args_list == [
-                mock.call(disk, resolved_images[0], "b" * 64, 1024, sudo_session),
-                mock.call(disk, resolved_images[0], "b" * 64, 1024, sudo_session),
+                mock.call(first_disk, resolved_images[0], "b" * 64, 1024, sudo_session),
+                mock.call(second_disk, resolved_images[0], "b" * 64, 1024, sudo_session),
             ]
         else:
             check_media.assert_not_called()
             verify_image.assert_not_called()
-    expected_card_events = [("enter", disk, sudo_session), "write"]
-    if check_cards:
-        expected_card_events.append("verify")
-    expected_card_events.extend([("exit", disk, sudo_session), "cloud-init"])
-    assert automatic_mount_guard == expected_card_events * 2
+        assert [cloud_init_call.args[0] for cloud_init_call in cloud_init.call_args_list] == [
+            first_disk,
+            second_disk,
+        ]
+        assert eject.call_args_list == [
+            mock.call(first_disk, quiet=True),
+            mock.call(first_disk),
+            mock.call(second_disk),
+        ]
+    interrupted_attempt_events = [
+        ("power-enter", sudo_session),
+        ("enter", first_disk, sudo_session),
+        "write",
+        ("exit", first_disk, sudo_session),
+        ("power-exit", sudo_session),
+    ]
+    verification_events = ["verify"] if check_cards else []
+    first_card_events = [
+        ("power-enter", sudo_session),
+        ("enter", first_disk, sudo_session),
+        "write",
+        *verification_events,
+        ("exit", first_disk, sudo_session),
+        "cloud-init",
+        ("power-commit", sudo_session),
+        ("power-exit", sudo_session),
+    ]
+    second_card_events = [
+        ("power-enter", sudo_session),
+        ("enter", second_disk, sudo_session),
+        "write",
+        *verification_events,
+        ("exit", second_disk, sudo_session),
+        "cloud-init",
+        ("power-commit", sudo_session),
+        ("power-exit", sudo_session),
+    ]
+    assert card_operation_events == interrupted_attempt_events + first_card_events + second_card_events
     assert len(downloaded_paths) == 1
     assert not downloaded_paths[0].exists()
-    assert "SSH commands:\nssh pomponchik@pi-5.local\nssh pomponchik@pi-6.local\n" in capsys.readouterr().out
+    captured_output = capsys.readouterr().out
+    attempt_headers = [
+        line for line in captured_output.splitlines() if line.startswith("Preparation attempt ")
+    ]
+    assert attempt_headers == [
+        "Preparation attempt 1 for pi-5.local on /dev/disk4",
+        "Preparation attempt 2 for pi-5.local on /dev/disk4",
+        "Preparation attempt 1 for pi-6.local on /dev/disk4",
+    ]
+    assert (
+        "SSH commands:\nssh pomponchik@pi-5.local\nssh pomponchik@pi-6.local\n"
+        in captured_output
+    )
 
 
 @pytest.mark.parametrize("selection_mode", ["forced", "interactive"])
 @pytest.mark.parametrize("auth_mode", ["ssh-key", "password"])
-def test_main_uses_one_sudo_session_for_all_cards(auth_mode, selection_mode, monkeypatch, automatic_mount_guard):
-    """Reuse one sudo session for two cards across selection and login modes."""
+def test_main_uses_one_sudo_session_for_all_cards(
+    auth_mode, selection_mode, monkeypatch, card_operation_events
+):
+    """Reuse one sudo session for both cards in every selection and authentication-mode combination."""
 
     first_disk = burn.Disk("disk4", "First SD Card", 32 * 1024**3, "USB", False, True, True)
     second_disk = burn.Disk("disk5", "Second SD Card", 32 * 1024**3, "USB", False, True, True)
@@ -3718,6 +4699,7 @@ def test_main_uses_one_sudo_session_for_all_cards(auth_mode, selection_mode, mon
             expected_password_hash,
             "wifi",
             "secret",
+            heartbeat=sudo_session.keep_alive,
         ),
         mock.call(
             second_disk,
@@ -3728,13 +4710,16 @@ def test_main_uses_one_sudo_session_for_all_cards(auth_mode, selection_mode, mon
             expected_password_hash,
             "wifi",
             "secret",
+            heartbeat=sudo_session.keep_alive,
         ),
     ]
     assert eject.call_args_list == [mock.call(first_disk), mock.call(second_disk)]
-    assert sudo_session.keep_alive.call_count == (2 if selection_mode == "forced" else 0)
+    assert sudo_session.keep_alive.call_count == (4 if selection_mode == "forced" else 2)
 
 
-def test_main_does_not_eject_completed_card_again_when_next_card_wait_fails(monkeypatch, automatic_mount_guard):
+def test_main_does_not_eject_completed_card_again_when_next_card_wait_fails(
+    monkeypatch, card_operation_events
+):
     """Do not re-eject a completed card if authorization fails while awaiting the next card."""
 
     first_disk = burn.Disk("disk4", "First SD Card", 32 * 1024**3, "USB", False, True, True)
@@ -3797,8 +4782,14 @@ def test_main_does_not_eject_completed_card_again_when_next_card_wait_fails(monk
     eject.assert_called_once_with(first_disk)
 
 
-def test_main_does_not_eject_rejected_forced_card_when_reselection_fails(monkeypatch, automatic_mount_guard):
-    """Do not eject a rejected forced card if authorization fails during reselection."""
+def test_main_does_not_eject_rejected_explicitly_selected_card_when_reselection_fails(
+    monkeypatch, card_operation_events
+):
+    """Do not emergency-eject a card selected via ``--device`` if reselection fails.
+
+    The integrity check fails, the user returns to interactive card selection,
+    and authorization then fails.
+    """
 
     bad_disk = burn.Disk("disk4", "Bad SD Card", 32 * 1024**3, "USB", False, True, True)
     image = burn.ImageSpec(Path("ubuntu.img"), None, "test image", uncompressed_size=1024)
@@ -3859,7 +4850,7 @@ def test_main_does_not_eject_rejected_forced_card_when_reselection_fails(monkeyp
 
 @pytest.mark.parametrize("continue_with_failed_card", [True, False], ids=["skip", "back"])
 def test_main_forwards_heartbeat_through_interactive_failed_check_actions(
-    continue_with_failed_card, monkeypatch, automatic_mount_guard
+    continue_with_failed_card, monkeypatch, card_operation_events
 ):
     """Forward the sudo heartbeat through card selection and the failed-check prompt for skip and back."""
 
@@ -3914,7 +4905,9 @@ def test_main_forwards_heartbeat_through_interactive_failed_check_actions(
 
 
 @pytest.mark.parametrize("policy", ["abort", "skip"])
-def test_noninteractive_main_honors_failed_check_policy(policy, monkeypatch, automatic_mount_guard):
+def test_noninteractive_main_honors_failed_check_policy(
+    policy, monkeypatch, card_operation_events
+):
     """Abort by default or continue explicitly after a failed non-interactive check."""
 
     disk = burn.Disk("disk4", "SD Card", 32 * 1024**3, "USB", False, True, True)
@@ -3983,9 +4976,9 @@ def test_noninteractive_main_honors_failed_check_policy(policy, monkeypatch, aut
     ["check", "write", "verify", "interrupt", "cloud-init", "eject", "emergency-eject"],
 )
 def test_main_quietly_ejects_current_card_after_failure_or_cancellation(
-    failure_scenario, capsys, monkeypatch, automatic_mount_guard
+    failure_scenario, capsys, monkeypatch, card_operation_events
 ):
-    """Attempt quiet ejection after failure without masking the primary exception."""
+    """After failure or cancellation, attempt a quiet eject without replacing the primary exception."""
 
     disk = burn.Disk("disk4", "SD Card", 32 * 1024**3, "USB", False, True, True)
     image = burn.ImageSpec(Path("ubuntu.img"), None, "test image", uncompressed_size=1024)
@@ -4075,12 +5068,14 @@ def test_main_quietly_ejects_current_card_after_failure_or_cancellation(
                     None,
                     "wifi",
                     "secret",
+                    heartbeat=sudo_session.keep_alive,
                 )
             )
             if failure_scenario == "eject":
                 expected_operations.append(mock.call.eject(disk))
     expected_operations.append(mock.call.eject(disk, quiet=True))
     assert operations.mock_calls == expected_operations
+    assert ("power-commit", sudo_session) not in card_operation_events
     captured_output = capsys.readouterr()
     if failure_scenario == "emergency-eject":
         assert "Warning: emergency ejection failed: emergency eject failed" in captured_output.err
