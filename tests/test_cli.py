@@ -3113,7 +3113,8 @@ def test_image_write_preserves_control_plane_failure_or_cancellation_when_cleanu
     process = FakeDDProcess()
     if poll_fails:
         process.poll = mock.Mock(side_effect=OSError("poll failed"))
-    process.input_stream.close = mock.Mock(side_effect=close_error_type("close failed"))
+    failing_close = mock.Mock(side_effect=close_error_type("close failed"))
+    process.input_stream.close = failing_close
     process.communicate = mock.Mock(side_effect=OSError("stderr failed"))
     heartbeat_exception = heartbeat_exception_type("transfer interrupted")
     sudo_session = mock.Mock(spec=burn.SudoSession)
@@ -3134,11 +3135,13 @@ def test_image_write_preserves_control_plane_failure_or_cancellation_when_cleanu
     ), pytest.raises(heartbeat_exception_type) as raised:
         burn.write_image(disk, image, sudo_session)
 
+    # Prevent BytesIO finalization from repeating the deliberately failing close.
+    failing_close.side_effect = None
     assert raised.value is heartbeat_exception
     sudo_session.authenticate.assert_not_called()
     assert process.input_stream.getvalue() == data[:4]
     assert process.stdin is None
-    process.input_stream.close.assert_called_once_with()
+    failing_close.assert_called_once_with()
     killpg.assert_called_once_with(process.pid, burn.signal.SIGTERM)
     assert process.wait_calls == 1
     process.communicate.assert_called_once_with()

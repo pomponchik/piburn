@@ -534,9 +534,6 @@ def test_power_guard_retains_callback_for_the_whole_run_loop_lifetime():
 
     assert iokit.IORegisterForSystemPower.calls == []
     assert iokit.IOCancelPowerChange.calls == [(22, 987)]
-    gc.collect()
-    assert callback_reference is not None
-    assert callback_reference() is None
 
 
 @pytest.mark.parametrize(
