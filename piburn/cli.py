@@ -45,6 +45,9 @@ CHUNK_SIZE = 4 * 1024**2
 INTEGRITY_PATTERN_BLOCK_SIZE = CHUNK_SIZE
 SUDO_REFRESH_INTERVAL = 60.0
 MOUNT_GUARD_READY_TIMEOUT = 10.0
+POWER_GUARD_READY_TIMEOUT = 10.0
+POWER_GUARD_SLEEP_GRACE_TIMEOUT = 1.0
+POWER_GUARD_SLEEP_EXIT_CODE = 75
 USER_AGENT = "cluster-burn/1.0"
 PASSWORD_ALPHABET = string.ascii_letters + string.digits
 CRYPT_ALPHABET = "./0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
@@ -56,6 +59,10 @@ class BurnError(RuntimeError):
 
 class SudoError(BurnError):
     """Administrator authorization could not be obtained or refreshed."""
+
+
+class SystemSleepError(BurnError):
+    """A confirmed, non-cancellable macOS system sleep interrupted the card."""
 
 
 class FetchError(BurnError):
@@ -157,6 +164,61 @@ class SudoSession:
         self.next_refresh = time.monotonic() + self.refresh_interval
 
 
+def stop_helper_process(process: subprocess.Popen[bytes]) -> str:
+    """Best-effort terminate, escalate, and reap a private helper process."""
+    diagnostics = []  # type: List[str]
+    stderr = b""
+
+    try:
+        running = process.poll() is None
+    except OSError as exc:
+        diagnostics.append("could not inspect helper: {}".format(exc))
+        running = True
+
+    if running:
+        try:
+            process.terminate()
+        except OSError as exc:
+            diagnostics.append("could not terminate helper: {}".format(exc))
+
+    try:
+        _stdout, stderr = process.communicate(timeout=3)
+    except subprocess.TimeoutExpired:
+        try:
+            process.kill()
+        except OSError as exc:
+            diagnostics.append("could not kill helper: {}".format(exc))
+        try:
+            _stdout, stderr = process.communicate(timeout=3)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            diagnostics.append("could not reap helper after kill: {}".format(exc))
+            try:
+                process.wait(timeout=3)
+            except (OSError, subprocess.TimeoutExpired) as wait_exc:
+                diagnostics.append("could not wait for helper after kill: {}".format(wait_exc))
+    except OSError as exc:
+        diagnostics.append("could not reap helper: {}".format(exc))
+        should_kill = True
+        try:
+            should_kill = process.poll() is None
+        except OSError as poll_exc:
+            diagnostics.append("could not inspect helper after reap failure: {}".format(poll_exc))
+        if should_kill:
+            try:
+                process.kill()
+            except OSError as kill_exc:
+                diagnostics.append("could not kill helper after reap failure: {}".format(kill_exc))
+        try:
+            process.wait(timeout=3)
+        except (OSError, subprocess.TimeoutExpired) as wait_exc:
+            diagnostics.append("could not stop helper after reap failure: {}".format(wait_exc))
+
+    stderr_detail = (stderr or b"").decode("utf-8", "replace").strip()
+    if stderr_detail:
+        diagnostics.insert(0, stderr_detail)
+    return "; ".join(diagnostics)
+
+
 class AutomaticMountGuard:
     """Keep a separate Disk Arbitration helper alive for one whole disk."""
 
@@ -166,37 +228,58 @@ class AutomaticMountGuard:
 
     def start(self) -> None:
         ensure_same_disk(self.disk)
+        process = None  # type: Optional[subprocess.Popen[bytes]]
         try:
-            self.process = subprocess.Popen(
+            process = subprocess.Popen(
                 [sys.executable, "-m", "piburn._mount_guard", self.disk.identifier],
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
             )
-        except OSError as exc:
-            raise BurnError("Could not start the automatic-mount guard: {}".format(exc))
-        assert self.process.stdout is not None
-        try:
+            self.process = process
+            if process.stdout is None:
+                detail = self.stop()
+                process = None
+                raise BurnError(
+                    "Could not initialize the automatic-mount guard for {}{}".format(
+                        self.disk.device,
+                        ": " + detail if detail else "",
+                    )
+                )
             readable, _writable, _exceptional = select.select(
-                [self.process.stdout], [], [], MOUNT_GUARD_READY_TIMEOUT
+                [process.stdout], [], [], MOUNT_GUARD_READY_TIMEOUT
             )
-            ready_message = self.process.stdout.readline() if readable else b""
+            ready_message = process.stdout.readline() if readable else b""
+            if ready_message != b"READY\n":
+                detail = self.stop()
+                process = None
+                raise BurnError(
+                    "Could not initialize the automatic-mount guard for {}{}".format(
+                        self.disk.device,
+                        ": " + detail if detail else "",
+                    )
+                )
         except OSError as exc:
-            detail = self.stop()
+            if process is None:
+                raise BurnError("Could not start the automatic-mount guard: {}".format(exc))
+            detail = self.stop() if self.process is not None else stop_helper_process(process)
             raise BurnError(
                 "Could not initialize the automatic-mount guard: {}{}".format(
                     exc,
                     ": " + detail if detail else "",
                 )
             )
-        if ready_message != b"READY\n":
-            detail = self.stop()
-            raise BurnError(
-                "Could not initialize the automatic-mount guard for {}{}".format(
-                    self.disk.device,
-                    ": " + detail if detail else "",
-                )
-            )
+        except BaseException:
+            if self.process is not None:
+                self.stop()
+            elif process is not None:
+                try:
+                    still_running = process.poll() is None
+                except OSError:
+                    still_running = True
+                if still_running:
+                    stop_helper_process(process)
+            raise
 
     def keep_alive(self) -> None:
         if self.process is None:
@@ -220,18 +303,155 @@ class AutomaticMountGuard:
         self.process = None
         if process is None:
             return ""
-        if process.poll() is None:
-            with contextlib.suppress(ProcessLookupError):
-                process.terminate()
+        return stop_helper_process(process)
+
+
+class SystemSleepGuard:
+    """Keep the power helper alive and translate its sleep protocol."""
+
+    def __init__(self) -> None:
+        self.process = None  # type: Optional[subprocess.Popen[bytes]]
+        self.committed = False
+        self.protocol_stdout = b""
+
+    def start(self) -> None:
+        self.committed = False
+        self.protocol_stdout = b""
+        process = None  # type: Optional[subprocess.Popen[bytes]]
         try:
-            _stdout, stderr = process.communicate(timeout=3)
-        except subprocess.TimeoutExpired:
-            with contextlib.suppress(ProcessLookupError):
-                process.kill()
-            _stdout, stderr = process.communicate()
+            process = subprocess.Popen(
+                [sys.executable, "-m", "piburn._power_guard"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            self.process = process
+            if process.stdout is None:
+                detail = self.stop()
+                process = None
+                raise BurnError(
+                    "Could not initialize the macOS power guard{}".format(
+                        ": " + detail if detail else ""
+                    )
+                )
+            readable, _writable, _exceptional = select.select(
+                [process.stdout], [], [], POWER_GUARD_READY_TIMEOUT
+            )
+            ready_message = process.stdout.readline() if readable else b""
+            if ready_message != b"READY\n":
+                detail = self.stop()
+                process = None
+                raise BurnError(
+                    "Could not initialize the macOS power guard{}".format(
+                        ": " + detail if detail else ""
+                    )
+                )
+            self.keep_alive()
         except OSError as exc:
-            return str(exc)
-        return (stderr or b"").decode("utf-8", "replace").strip()
+            if process is None:
+                raise BurnError("Could not start the macOS power guard: {}".format(exc))
+            detail = self.stop() if self.process is not None else stop_helper_process(process)
+            raise BurnError(
+                "Could not initialize the macOS power guard: {}{}".format(
+                    exc,
+                    ": " + detail if detail else "",
+                )
+            )
+        except BaseException:
+            if self.process is not None:
+                self.stop()
+            elif process is not None:
+                try:
+                    still_running = process.poll() is None
+                except OSError:
+                    still_running = True
+                if still_running:
+                    stop_helper_process(process)
+            raise
+
+    @staticmethod
+    def _is_sleep_event(returncode: int, stdout: bytes) -> bool:
+        return returncode == POWER_GUARD_SLEEP_EXIT_CODE and b"SLEEP" in stdout.splitlines()
+
+    @staticmethod
+    def _poll(process: subprocess.Popen[bytes]) -> Optional[int]:
+        try:
+            return process.poll()
+        except OSError as exc:
+            raise BurnError("Could not inspect the macOS power guard: {}".format(exc)) from exc
+
+    @staticmethod
+    def _communicate(
+        process: subprocess.Popen[bytes], timeout: Optional[float] = None
+    ) -> Tuple[Optional[bytes], Optional[bytes]]:
+        try:
+            if timeout is None:
+                return process.communicate()
+            return process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            raise
+        except OSError as exc:
+            raise BurnError("Could not read the macOS power guard result: {}".format(exc)) from exc
+
+    def keep_alive(self, protocol_timeout: float = 0.0) -> None:
+        if self.committed:
+            return
+        if self.process is None:
+            raise BurnError("The macOS power guard is not running")
+        process = self.process
+        returncode = self._poll(process)
+        if returncode is None:
+            assert process.stdout is not None
+            try:
+                readable, _writable, _exceptional = select.select(
+                    [process.stdout], [], [], protocol_timeout
+                )
+                protocol_line = process.stdout.readline() if readable else b""
+            except OSError as exc:
+                raise BurnError("Could not read the macOS power-guard protocol: {}".format(exc))
+            self.protocol_stdout += protocol_line
+            if b"SLEEP" not in self.protocol_stdout.splitlines():
+                returncode = self._poll(process)
+                if returncode is None:
+                    return
+                stdout, stderr = self._communicate(process)
+            else:
+                try:
+                    stdout, stderr = self._communicate(process, timeout=3)
+                except subprocess.TimeoutExpired as exc:
+                    raise BurnError(
+                        "The macOS power guard reported sleep but did not terminate"
+                    ) from exc
+                returncode = self._poll(process)
+                if returncode is None:
+                    raise BurnError("The macOS power guard did not report an exit code")
+        else:
+            stdout, stderr = self._communicate(process)
+        self.protocol_stdout += stdout or b""
+        self.process = None
+        if self._is_sleep_event(returncode, self.protocol_stdout):
+            raise SystemSleepError(
+                "macOS entered forced sleep during card preparation; the current attempt was discarded"
+            )
+        detail = (stderr or b"").decode("utf-8", "replace").strip()
+        raise BurnError(
+            "The macOS power guard stopped unexpectedly (exit code {}){}".format(
+                returncode,
+                ": " + detail if detail else "",
+            )
+        )
+
+    def commit(self) -> None:
+        """Mark successful eject as the point after which sleep is irrelevant."""
+        self.keep_alive()
+        self.committed = True
+
+    def stop(self) -> str:
+        process = self.process
+        self.process = None
+        if process is None:
+            return ""
+        return stop_helper_process(process)
 
 
 @contextlib.contextmanager
@@ -247,6 +467,37 @@ def prevent_automatic_mounts(disk: Disk, sudo_session: SudoSession) -> Iterator[
     finally:
         sudo_session.remove_heartbeat(guard.keep_alive)
         guard.stop()
+
+
+@contextlib.contextmanager
+def prevent_system_sleep(sudo_session: SudoSession) -> Iterator[SystemSleepGuard]:
+    """Prevent idle sleep and turn a confirmed forced sleep into a safe retry signal."""
+    guard = SystemSleepGuard()
+    guard.start()
+    sudo_session.add_heartbeat(guard.keep_alive)
+    try:
+        guard.keep_alive()
+        try:
+            yield guard
+        except BaseException as primary_error:
+            if isinstance(primary_error, (SystemSleepError, KeyboardInterrupt)):
+                raise
+            try:
+                guard.keep_alive(protocol_timeout=POWER_GUARD_SLEEP_GRACE_TIMEOUT)
+            except SystemSleepError as sleep_error:
+                raise sleep_error from primary_error
+            except BurnError:
+                # A body failure remains authoritative unless the helper proved
+                # that forced sleep occurred with both protocol markers.
+                pass
+            raise
+        if not guard.committed:
+            guard.keep_alive()
+    finally:
+        sudo_session.remove_heartbeat(guard.keep_alive)
+        cleanup_detail = guard.stop()
+        if cleanup_detail:
+            eprint("Warning: macOS power-guard cleanup: {}".format(cleanup_detail))
 
 
 class TerminalInputParser:
@@ -1151,8 +1402,35 @@ def popen_or_error(args: Sequence[str], **kwargs: Any) -> subprocess.Popen[bytes
         raise BurnError("Could not start {}: {}".format(args[0], exc))
 
 
-def unmount_disk(disk: Disk) -> None:
-    run(["diskutil", "unmountDisk", disk.device])
+def unmount_disk(
+    disk: Disk,
+    heartbeat: Optional[Callable[[], None]] = None,
+    attempts: int = 5,
+    retry_interval: float = 1.0,
+) -> None:
+    """Wait briefly for a transient Disk Arbitration unmount failure."""
+    if attempts <= 0:
+        raise BurnError("The unmount attempt count must be positive")
+    retry_prefix = "Unmount failed for {}".format(disk.device)
+    last_detail = ""
+    for attempt in range(1, attempts + 1):
+        if heartbeat is not None:
+            heartbeat()
+        ensure_same_disk(disk)
+        result = run(["diskutil", "unmountDisk", disk.device], check=False)
+        if result.returncode == 0:
+            return
+        last_detail = (result.stderr or result.stdout or b"").decode("utf-8", "replace").strip()
+        if last_detail != retry_prefix and not last_detail.startswith(retry_prefix + ":"):
+            raise BurnError("Command diskutil failed: {}".format(last_detail or result.returncode))
+        if attempt < attempts:
+            time.sleep(retry_interval)
+    raise BurnError(
+        "Command diskutil failed after {} attempts: {}".format(
+            attempts,
+            last_detail,
+        )
+    )
 
 
 def eject_disk(disk: Disk, quiet: bool = False) -> None:
@@ -1160,6 +1438,16 @@ def eject_disk(disk: Disk, quiet: bool = False) -> None:
     if result.returncode != 0 and not quiet:
         detail = result.stderr.decode("utf-8", "replace").strip()
         raise BurnError("Could not eject {}: {}".format(disk.device, detail))
+
+
+def quietly_eject_same_disk(disk: Disk) -> bool:
+    """Eject only when the selected path still has the complete fingerprint."""
+    try:
+        current = ensure_same_disk(disk)
+    except BurnError:
+        return False
+    eject_disk(current, quiet=True)
+    return True
 
 
 def write_all(stream: Any, data: bytes) -> None:
@@ -1203,9 +1491,7 @@ def integrity_pattern(seed: bytes, offset: int, length: int) -> bytes:
 
 
 def write_integrity_pattern(disk: Disk, sudo_session: SudoSession, seed: bytes) -> None:
-    sudo_session.keep_alive()
-    ensure_same_disk(disk)
-    unmount_disk(disk)
+    unmount_disk(disk, heartbeat=sudo_session.keep_alive)
     ensure_same_disk(disk)
     process = popen_or_error(
         ["sudo", "-n", "dd", "of=" + disk.raw_device, "bs=" + str(CHUNK_SIZE), "conv=fsync"],
@@ -1238,7 +1524,6 @@ def write_integrity_pattern(disk: Disk, sudo_session: SudoSession, seed: bytes) 
                 terminate_process_group(process)
         else:
             terminate_process_group(process)
-            process.wait()
         if isinstance(exc, KeyboardInterrupt):
             raise
         if isinstance(exc, BurnError):
@@ -1285,7 +1570,6 @@ def verify_integrity_pattern(disk: Disk, sudo_session: SudoSession, seed: bytes)
         stderr = process.communicate()[1].decode("utf-8", "replace")
     except (KeyboardInterrupt, BurnError, OSError) as exc:
         terminate_process_group(process)
-        process.wait()
         if isinstance(exc, KeyboardInterrupt):
             raise
         if isinstance(exc, BurnError):
@@ -1312,9 +1596,13 @@ def check_media(disk: Disk, sudo_session: SudoSession) -> bool:
         verify_integrity_pattern(disk, sudo_session, seed)
         print("The card passed the full write/read integrity test.")
         return True
-    except SudoError:
+    except (SudoError, SystemSleepError):
         raise
     except BurnError as exc:
+        # A forced-sleep notification can race with the card I/O error it
+        # caused.  Check the attached control-plane heartbeats before blaming
+        # otherwise healthy media.
+        sudo_session.keep_alive()
         eprint("The card failed the integrity test: {}".format(exc))
         return False
 
@@ -1408,16 +1696,48 @@ def uncompressed_image_size(path: Path) -> int:
 
 
 def terminate_process_group(process: subprocess.Popen[bytes]) -> None:
-    if process.poll() is not None:
-        return
-    with contextlib.suppress(ProcessLookupError):
+    """Best-effort stop and reap dd without masking its primary failure."""
+    diagnostics = []  # type: List[str]
+    try:
+        if process.poll() is not None:
+            return
+    except OSError as exc:
+        diagnostics.append("could not inspect dd: {}".format(exc))
+
+    try:
         os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    except OSError as exc:
+        diagnostics.append("could not terminate dd process group: {}".format(exc))
     try:
         process.wait(timeout=3)
     except subprocess.TimeoutExpired:
-        with contextlib.suppress(ProcessLookupError):
+        try:
             os.killpg(process.pid, signal.SIGKILL)
-        process.wait()
+        except ProcessLookupError:
+            pass
+        except OSError as exc:
+            diagnostics.append("could not kill dd process group: {}".format(exc))
+        try:
+            process.wait(timeout=3)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            diagnostics.append("could not reap dd after kill: {}".format(exc))
+    except OSError as exc:
+        diagnostics.append("could not reap dd after termination: {}".format(exc))
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except OSError as kill_exc:
+            diagnostics.append("could not kill dd process group: {}".format(kill_exc))
+        try:
+            process.wait(timeout=3)
+        except (OSError, subprocess.TimeoutExpired) as wait_exc:
+            diagnostics.append("could not reap dd after kill: {}".format(wait_exc))
+
+    if diagnostics:
+        eprint("Warning: dd cleanup: {}".format("; ".join(diagnostics)))
 
 
 def close_process_stdin(process: subprocess.Popen[bytes]) -> None:
@@ -1443,9 +1763,7 @@ def read_disk_block(disk: Disk, block_start: int, length: int, sudo_session: Sud
         raise BurnError("The diagnostic block offset is not aligned")
     if length < 0 or length > CHUNK_SIZE:
         raise BurnError("The diagnostic block length is invalid")
-    sudo_session.keep_alive()
-    ensure_same_disk(disk)
-    unmount_disk(disk)
+    unmount_disk(disk, heartbeat=sudo_session.keep_alive)
     ensure_same_disk(disk)
     process = popen_or_error(
         [
@@ -1468,7 +1786,6 @@ def read_disk_block(disk: Disk, block_start: int, length: int, sudo_session: Sud
         stderr = process.communicate()[1].decode("utf-8", "replace")
     except (KeyboardInterrupt, BurnError, OSError) as exc:
         terminate_process_group(process)
-        process.wait()
         if isinstance(exc, KeyboardInterrupt):
             raise
         if isinstance(exc, BurnError):
@@ -1552,9 +1869,7 @@ def verify_written_image(
     started = time.monotonic()
     try:
         with verified_source_stream(image) as source:
-            sudo_session.keep_alive()
-            ensure_same_disk(disk)
-            unmount_disk(disk)
+            unmount_disk(disk, heartbeat=sudo_session.keep_alive)
             ensure_same_disk(disk)
             process = popen_or_error(
                 [
@@ -1601,7 +1916,6 @@ def verify_written_image(
     except (KeyboardInterrupt, BurnError, EOFError, lzma.LZMAError, OSError) as exc:
         if process is not None:
             terminate_process_group(process)
-            process.wait()
         if isinstance(exc, KeyboardInterrupt):
             raise
         if isinstance(exc, BurnError):
@@ -1639,6 +1953,10 @@ def verify_written_image(
                 read_disk_block(disk, mismatch_block_start, len(mismatch_expected), sudo_session)
             )
             diagnostic_errors.append(None)
+        except (SystemSleepError, SudoError):
+            # Control-plane failures are not evidence about card contents and,
+            # for forced sleep, must reach the card-attempt retry machine.
+            raise
         except BurnError as exc:
             repeated_blocks.append(None)
             diagnostic_errors.append(str(exc))
@@ -1697,9 +2015,7 @@ def write_image(disk: Disk, image: ImageSpec, sudo_session: SudoSession) -> Tupl
         with verified_source_stream(image) as source:
             # The source has been opened and re-verified before the first
             # destructive operation, closing the common replace-after-check race.
-            sudo_session.keep_alive()
-            ensure_same_disk(disk)
-            unmount_disk(disk)
+            unmount_disk(disk, heartbeat=sudo_session.keep_alive)
             ensure_same_disk(disk)
             process = popen_or_error(
                 ["sudo", "-n", "dd", "of=" + disk.raw_device, "bs=" + str(CHUNK_SIZE), "conv=fsync"],
@@ -1743,8 +2059,7 @@ def write_image(disk: Disk, image: ImageSpec, sudo_session: SudoSession) -> Tupl
                 if returncode is None:
                     terminate_process_group(process)
             else:
-                if process.poll() is None:
-                    terminate_process_group(process)
+                terminate_process_group(process)
                 detail = process_stderr(process)
                 returncode = process.returncode
         if isinstance(exc, KeyboardInterrupt):
@@ -1766,16 +2081,24 @@ def write_image(disk: Disk, image: ImageSpec, sudo_session: SudoSession) -> Tupl
     # automatically mount its FAT boot partition and let macOS services modify
     # it.  Unmount immediately so post-flash verification observes the bytes
     # written by dd rather than host-generated filesystem changes.
-    unmount_disk(disk)
+    unmount_disk(disk, heartbeat=sudo_session.keep_alive)
     ensure_same_disk(disk)
     return digest.hexdigest(), written
 
 
-def find_boot_mount(disk: Disk) -> Path:
+def find_boot_mount(
+    disk: Disk,
+    heartbeat: Optional[Callable[[], None]] = None,
+) -> Path:
+    if heartbeat is not None:
+        heartbeat()
     ensure_same_disk(disk)
     run(["diskutil", "mountDisk", disk.device], check=False)
     deadline = time.monotonic() + 15
     while time.monotonic() < deadline:
+        if heartbeat is not None:
+            heartbeat()
+        ensure_same_disk(disk)
         listing = diskutil_plist("list", disk.device)
         entries = listing.get("AllDisksAndPartitions", [])
         partitions = []  # type: List[object]
@@ -1792,6 +2115,8 @@ def find_boot_mount(disk: Disk) -> Path:
             volume = str(info.get("VolumeName") or "").lower()
             filesystem = str(info.get("FilesystemType") or info.get("Type (Bundle)") or "").lower()
             if mount and (volume == "system-boot" or "msdos" in filesystem or "fat" in filesystem):
+                if heartbeat is not None:
+                    heartbeat()
                 return Path(str(mount))
         time.sleep(1)
     raise BurnError("Could not mount the Ubuntu boot partition on {}".format(disk.device))
@@ -1806,8 +2131,9 @@ def write_cloud_init(
     password_hash: Optional[str],
     ssid: str,
     wifi_password: str,
+    heartbeat: Optional[Callable[[], None]] = None,
 ) -> None:
-    mount = find_boot_mount(disk)
+    mount = find_boot_mount(disk, heartbeat=heartbeat)
     files = {
         "user-data": render_user_data(hostname, username, timezone, ssh_key, password_hash),
         "network-config": render_network_config(ssid, wifi_password),
@@ -1815,14 +2141,25 @@ def write_cloud_init(
     }
     try:
         for name, contents in files.items():
+            if heartbeat is not None:
+                heartbeat()
+            ensure_same_disk(disk)
             path = mount / name
             temporary = mount / ("." + name + ".cluster-burn")
             temporary.write_text(contents, encoding="utf-8")
             os.replace(str(temporary), str(path))
+            if heartbeat is not None:
+                heartbeat()
     except OSError as exc:
-        raise BurnError("Could not write cloud-init files to {}: {}".format(mount, exc))
-    finally:
+        if heartbeat is not None:
+            heartbeat()
         run(["sync"], capture=False)
+        raise BurnError("Could not write cloud-init files to {}: {}".format(mount, exc))
+    if heartbeat is not None:
+        heartbeat()
+    run(["sync"], capture=False)
+    if heartbeat is not None:
+        heartbeat()
 
 
 def write_inventory(path: Path, hosts: Sequence[str], username: str) -> None:
@@ -2001,6 +2338,40 @@ def wait_for_disk(
                 print("Waiting for {}. Insert the next card; press Ctrl+C to quit.".format(device_path))
                 waiting_message_shown = True
             time.sleep(poll_interval)
+
+
+def wait_for_same_disk(
+    original: Disk,
+    poll_interval: float = 1.0,
+    heartbeat: Optional[Callable[[], None]] = None,
+) -> Disk:
+    """Wait for the selected media to return without trusting its BSD path alone."""
+    waiting_message_shown = False
+    while True:
+        if heartbeat is not None:
+            heartbeat()
+        try:
+            current = get_disk(original.device)
+        except BurnError:
+            if os.path.exists(original.device):
+                raise
+            if not waiting_message_shown:
+                print(
+                    "Waiting for the same card at {}. Physically remove and reinsert it if necessary; "
+                    "press Ctrl+C to quit.".format(original.device)
+                )
+                waiting_message_shown = True
+            time.sleep(poll_interval)
+            continue
+        if current.fingerprint != original.fingerprint:
+            raise BurnError(
+                "Different media appeared in {}; the sleep retry was stopped before any write".format(
+                    original.device
+                )
+            )
+        if waiting_message_shown:
+            print("The original card returned: {}".format(current.label))
+        return current
 
 
 def failed_check_action(heartbeat: Optional[Callable[[], None]] = None) -> bool:
@@ -2195,51 +2566,116 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 hostname = hostname_for(prefix, start_number + card_number - 1)
                 print("\nCard {}/{} → {}.local".format(card_number, count, hostname))
                 forced_device = args.device[card_number - 1] if args.device else None
+                card_complete = False
                 while True:
                     if forced_device:
                         current_disk = wait_for_disk(forced_device, heartbeat=sudo_session.keep_alive)
                     else:
                         current_disk = choose_disk(heartbeat=sudo_session.keep_alive)
+                    selected_disk = current_disk
                     last_selected_disk = current_disk
                     print("Selected: {}".format(current_disk.label))
-                    if not check_cards or check_media(current_disk, sudo_session):
-                        break
-                    if args.non_interactive:
-                        if args.on_check_failure == "skip":
-                            break
-                        raise BurnError("Card {} failed the integrity test".format(current_disk.device))
-                    if failed_check_action(heartbeat=sudo_session.keep_alive):
-                        break
-                    current_disk = None
-                    forced_device = None
-
-                with prevent_automatic_mounts(current_disk, sudo_session):
-                    image_digest, image_size = write_image(current_disk, image, sudo_session)
-                    if check_cards:
-                        print("Verifying the written image...")
-                        verify_written_image(
-                            current_disk,
-                            image,
-                            image_digest,
-                            image_size,
-                            sudo_session,
+                    integrity_resolved = not check_cards
+                    attempt = 1
+                    choose_another_disk = False
+                    while True:
+                        attempt_disk = selected_disk
+                        current_disk = attempt_disk
+                        print(
+                            "Preparation attempt {} for {}.local on {}".format(
+                                attempt,
+                                hostname,
+                                attempt_disk.device,
+                            )
                         )
-                write_cloud_init(
-                    current_disk,
-                    hostname,
-                    username,
-                    timezone,
-                    ssh_key,
-                    password_hash,
-                    ssid,
-                    wifi_password,
-                )
-                eject_disk(current_disk)
-                print(
-                    "Done: {} was ejected; the node will be available as {}.local".format(current_disk.device, hostname)
-                )
-                hosts.append(hostname + ".local")
-                current_disk = None
+                        try:
+                            with prevent_system_sleep(sudo_session) as sleep_guard:
+                                if not integrity_resolved:
+                                    if check_media(attempt_disk, sudo_session):
+                                        integrity_resolved = True
+                                    elif args.non_interactive:
+                                        if args.on_check_failure == "skip":
+                                            integrity_resolved = True
+                                        else:
+                                            raise BurnError(
+                                                "Card {} failed the integrity test".format(attempt_disk.device)
+                                            )
+                                    elif failed_check_action(heartbeat=sudo_session.keep_alive):
+                                        integrity_resolved = True
+                                    else:
+                                        choose_another_disk = True
+
+                                if choose_another_disk:
+                                    current_disk = None
+                                else:
+                                    with prevent_automatic_mounts(attempt_disk, sudo_session):
+                                        image_digest, image_size = write_image(
+                                            attempt_disk,
+                                            image,
+                                            sudo_session,
+                                        )
+                                        if check_cards:
+                                            print("Verifying the written image...")
+                                            verify_written_image(
+                                                attempt_disk,
+                                                image,
+                                                image_digest,
+                                                image_size,
+                                                sudo_session,
+                                            )
+                                    write_cloud_init(
+                                        attempt_disk,
+                                        hostname,
+                                        username,
+                                        timezone,
+                                        ssh_key,
+                                        password_hash,
+                                        ssid,
+                                        wifi_password,
+                                        heartbeat=sudo_session.keep_alive,
+                                    )
+                                    sudo_session.keep_alive()
+                                    ensure_same_disk(attempt_disk)
+                                    eject_disk(attempt_disk)
+                                    sleep_guard.commit()
+                        except SystemSleepError as exc:
+                            print(
+                                "Attempt {} was interrupted by forced system sleep: {}".format(
+                                    attempt,
+                                    exc,
+                                )
+                            )
+                            try:
+                                quietly_eject_same_disk(selected_disk)
+                            except BurnError as eject_error:
+                                eprint(
+                                    "Warning: sleep-recovery ejection failed: {}".format(eject_error)
+                                )
+                            current_disk = None
+                            selected_disk = wait_for_same_disk(
+                                selected_disk,
+                                heartbeat=sudo_session.keep_alive,
+                            )
+                            attempt += 1
+                            continue
+
+                        if choose_another_disk:
+                            forced_device = None
+                            current_disk = None
+                            break
+
+                        print(
+                            "Done: {} was ejected; the node will be available as {}.local".format(
+                                attempt_disk.device,
+                                hostname,
+                            )
+                        )
+                        hosts.append(hostname + ".local")
+                        current_disk = None
+                        card_complete = True
+                        break
+                    if card_complete:
+                        break
 
             create_inventory = args.inventory
             if create_inventory is None:
@@ -2261,7 +2697,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         except BaseException as exc:
             if current_disk is not None:
                 try:
-                    eject_disk(current_disk, quiet=True)
+                    quietly_eject_same_disk(current_disk)
                 except BurnError as eject_error:
                     eprint("Warning: emergency ejection failed: {}".format(eject_error))
             if artifact_destination is not None and image is not None:
