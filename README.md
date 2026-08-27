@@ -32,6 +32,7 @@ The tool is intentionally conservative: it only lets you select physical, writab
 - [**What gets configured**](#what-gets-configured)
 - [**Login methods**](#login-methods)
 - [**Card integrity test**](#card-integrity-test)
+- [**Sleep and recovery on macOS**](#sleep-and-recovery-on-macos)
 - [**Non-interactive usage**](#non-interactive-usage)
 
 
@@ -65,7 +66,7 @@ piburn
 
 The interactive interface first asks how many cards to prepare and whether to run the full integrity test, then collects the Wi-Fi, hostname, and login settings. For each card, it asks you to select the target device. The starting hostname number defaults to `1`. Cards are prepared one at a time, so a single card reader is enough.
 
-Press `Ctrl+C` at any step to stop.
+Press `Ctrl+C` at any step to stop. The display may turn off and the screen may lock while a card is being prepared; neither interrupts the operation.
 
 After the last card, the tool asks whether to generate an [Ansible inventory](https://docs.ansible.com/projects/ansible/latest/inventory_guide/intro_inventory.html). If you accept, it creates or replaces `ansible/inventory.ini` by default; this file lists the nodes managed by Ansible. It then prints one SSH command per node:
 
@@ -112,6 +113,8 @@ The optional full integrity test writes a newly randomized, position-dependent p
 
 After Ubuntu is written, `piburn` performs a separate byte-for-byte comparison between the card and a freshly verified and decompressed source image. The full-card test and this post-flash verification cover different write operations: passing the first does not guarantee that a later image write cannot fail. Writes request an explicit `fsync`. During raw image writing and verification, a separate Disk Arbitration helper denies automatic mounts only for the selected card and its partitions; `piburn` also unmounts any partition that was already mounted. This prevents macOS services from changing the FAT boot partition before verification. The guard is released before `piburn` deliberately mounts that partition to write cloud-init configuration. Verification reads bypass the macOS cache. If data differs, `piburn` reports the first differing byte, full and per-block SHA-256 values, and whether repeated direct reads are stable, transient, or inconsistent. Any inconsistent read remains an error.
 
+If Disk Arbitration is briefly still settling after a write, `piburn` makes up to five ordinary whole-disk unmount attempts at one-second intervals. It never uses a forced unmount, and it rechecks the complete card fingerprint before every attempt.
+
 Downloaded images are normally removed after the run, including after automatic mismatch diagnostics. To retain the downloaded image and a secret-free diagnostic report after a failure, pass a destination directory:
 
 ```bash
@@ -119,6 +122,17 @@ piburn --keep-image-on-failure ./piburn-diagnostics
 ```
 
 For a remote image, `piburn` stages the temporary download on the destination filesystem so it can be preserved by an atomic rename without creating another multi-gigabyte copy. A successful run removes that staging directory without creating a failure subdirectory. After a failed or cancelled run, `piburn` creates a unique subdirectory and prints the resulting paths. A local image is not duplicated; the report refers to its existing path. Failure to preserve these artifacts is reported separately and never replaces the original write or verification error.
+
+
+## Sleep and recovery on macOS
+
+After a particular card is selected, `piburn` creates macOS power assertions until that card has been successfully ejected. These assertions prevent idle/system sleep during the integrity test, image write, direct verification, cloud-init changes, and eject. They deliberately do not prevent display sleep: the display can turn off and the Mac can lock normally. Image download, initial questions, waiting for a card, pauses between cards, and inventory creation are outside this protected interval.
+
+Power assertions are best-effort. macOS can still enter a forced sleep requested by the user or required by the system. `piburn` detects that event and discards the current attempt; it never resumes a partial raw write from an assumed byte offset. After wake, the image is written again from byte zero. Attempts are numbered, have no fixed limit, and can always be stopped with `Ctrl+C`.
+
+A fully completed integrity test is retained across these sleep attempts, as is an explicit decision to skip a failed test. If sleep interrupted the integrity test itself, the complete test starts again with a new randomized pattern. Ordinary card, image, sudo, cloud-init, and helper failures are not retried automatically.
+
+Before retrying, `piburn` waits for the original card on its original `/dev/diskN` path and compares the complete recorded fingerprint, not only the path. A reader may need the card to be physically removed and reinserted after wake. If a different device appears at that path, `piburn` stops before sending it any unmount, write, or eject command.
 
 
 ## Non-interactive usage
