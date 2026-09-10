@@ -55,7 +55,6 @@ show_missing = true
 skip_covered = true
 
 [tool.ruff]
-target-version = "py38"
 line-length = 120
 
 [tool.ruff.lint]
