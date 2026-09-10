@@ -18,6 +18,25 @@ import pytest
 from piburn import cli as burn
 
 
+@pytest.mark.parametrize(
+    ("is_tty", "expected_suffix"),
+    [
+        (True, "\033[K"),
+        (False, ""),
+    ],
+)
+def test_show_progress_clears_stale_text_only_in_terminal(is_tty, expected_suffix):
+    class FakeOutput(io.StringIO):
+        def isatty(self):
+            return is_tty
+
+    output = FakeOutput()
+    with mock.patch.object(burn.sys, "stdout", output):
+        burn.show_progress("Downloading image", 1024**3, 1536 * 1024**2)
+
+    assert output.getvalue() == "\rDownloading image: 66.7% (1.0 GiB/1.5 GiB)" + expected_suffix
+
+
 @pytest.fixture
 def card_operation_events(monkeypatch):
     """Replace both macOS helpers with in-process guards for main tests."""
