@@ -1381,7 +1381,8 @@ def show_progress(label: str, done: int, total: int, started: Optional[float] = 
         status = "{:.1f}% ({}/{}{})".format(percent, human_size(done), human_size(total), speed)
     else:
         status = "{}{}".format(human_size(done), speed)
-    sys.stdout.write("\r{}: {}".format(label, status))
+    clear_to_end = "\033[K" if sys.stdout.isatty() else ""
+    sys.stdout.write("\r{}: {}{}".format(label, status, clear_to_end))
     sys.stdout.flush()
 
 
