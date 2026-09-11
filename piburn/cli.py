@@ -2589,8 +2589,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         image_size = None  # type: Optional[int]
         current_disk = None  # type: Optional[Disk]
         last_selected_disk = None  # type: Optional[Disk]
+        preselected_disk = None  # type: Optional[Disk]
         try:
             sudo_session = ensure_sudo()
+
+            first_hostname = hostname_for(prefix, start_number)
+            print("\nCard 1/{} → {}.local".format(count, first_hostname))
+            first_forced_device = args.device[0] if args.device else None
+            if first_forced_device:
+                current_disk = wait_for_disk(
+                    first_forced_device,
+                    heartbeat=sudo_session.keep_alive,
+                )
+            else:
+                current_disk = choose_disk(heartbeat=sudo_session.keep_alive)
+            preselected_disk = current_disk
+            last_selected_disk = current_disk
+            print("Selected: {}".format(current_disk.label))
+            current_disk = None
+
             print("Finding and verifying the latest stable Ubuntu Server image for Raspberry Pi...")
             image = resolve_image(
                 args.image,
@@ -2601,7 +2618,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print("Image: {}".format(image.source))
             image_size = image.uncompressed_size
             if image_size is None:
-                print("Verifying the decompressed image before card selection...")
+                print("Verifying the decompressed image before writing...")
                 image_size, identity = inspect_image_file(
                     image.path,
                     heartbeat=sudo_session.keep_alive,
@@ -2615,17 +2632,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
             for card_number in range(1, count + 1):
                 hostname = hostname_for(prefix, start_number + card_number - 1)
-                print("\nCard {}/{} → {}.local".format(card_number, count, hostname))
+                if card_number > 1:
+                    print("\nCard {}/{} → {}.local".format(card_number, count, hostname))
                 forced_device = args.device[card_number - 1] if args.device else None
                 card_complete = False
                 while True:
-                    if forced_device:
+                    used_preselected_disk = preselected_disk is not None
+                    if preselected_disk is not None:
+                        current_disk = preselected_disk
+                        preselected_disk = None
+                    elif forced_device:
                         current_disk = wait_for_disk(forced_device, heartbeat=sudo_session.keep_alive)
                     else:
                         current_disk = choose_disk(heartbeat=sudo_session.keep_alive)
                     selected_disk = current_disk
                     last_selected_disk = current_disk
-                    print("Selected: {}".format(current_disk.label))
+                    if not used_preselected_disk:
+                        print("Selected: {}".format(current_disk.label))
                     integrity_resolved = not check_cards
                     attempt = 1
                     choose_another_disk = False
