@@ -1251,20 +1251,25 @@ def parse_sha256sums(text: str) -> Dict[str, str]:
     return sums
 
 
-def find_latest_release_image() -> Tuple[str, str, str]:
+def find_latest_release_image(
+    heartbeat: Optional[Callable[[], None]] = None,
+) -> Tuple[str, str, str]:
     """Return image URL, filename and SHA-256 for the newest published GA release.
 
     Ubuntu exposes directories for development releases too, so choosing the
     greatest directory name is insufficient. A release counts as published only
     if release/SHA256SUMS exists and contains the Raspberry Pi server image.
     """
-    index = fetch_bytes(RELEASES_URL).decode("utf-8", "replace")
+    index = fetch_bytes(RELEASES_URL, heartbeat=heartbeat).decode("utf-8", "replace")
     versions = set(re.findall(r'href=["\'](\d{2}\.\d{2})/["\']', index))
     ordered = sorted(versions, key=lambda item: tuple(int(part) for part in item.split(".")), reverse=True)
     for version in ordered:
         release_url = urllib.parse.urljoin(RELEASES_URL, version + "/release/")
         try:
-            sums_text = fetch_bytes(urllib.parse.urljoin(release_url, "SHA256SUMS")).decode("utf-8", "replace")
+            sums_text = fetch_bytes(
+                urllib.parse.urljoin(release_url, "SHA256SUMS"),
+                heartbeat=heartbeat,
+            ).decode("utf-8", "replace")
         except FetchError as exc:
             # Development release directories exist before their final images.
             if exc.status == 404:
@@ -1278,22 +1283,32 @@ def find_latest_release_image() -> Tuple[str, str, str]:
     raise BurnError("No published stable Ubuntu Server image for Raspberry Pi was found")
 
 
-def fetch_bytes(url: str) -> bytes:
+def fetch_bytes(url: str, heartbeat: Optional[Callable[[], None]] = None) -> bytes:
     request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     try:
         with urllib.request.urlopen(request, timeout=30) as response:
-            return cast(bytes, response.read())
+            chunks = []
+            while True:
+                if heartbeat is not None:
+                    heartbeat()
+                chunk = response.read(CHUNK_SIZE)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            return b"".join(chunks)
     except urllib.error.HTTPError as exc:
         raise FetchError("Could not download {}: HTTP {}".format(url, exc.code), exc.code)
     except (urllib.error.URLError, http.client.HTTPException, OSError) as exc:
         raise FetchError("Could not download {}: {}".format(url, exc))
 
 
-def sha256_file(path: Path) -> str:
+def sha256_file(path: Path, heartbeat: Optional[Callable[[], None]] = None) -> str:
     digest = hashlib.sha256()
     try:
         with path.open("rb") as source:
             while True:
+                if heartbeat is not None:
+                    heartbeat()
                 chunk = source.read(CHUNK_SIZE)
                 if not chunk:
                     break
@@ -1303,7 +1318,12 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def download_file(url: str, destination: Path, expected_sha256: Optional[str]) -> None:
+def download_file(
+    url: str,
+    destination: Path,
+    expected_sha256: Optional[str],
+    heartbeat: Optional[Callable[[], None]] = None,
+) -> None:
     temporary = destination.with_name(destination.name + ".part")
     request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     digest = hashlib.sha256()
@@ -1316,6 +1336,8 @@ def download_file(url: str, destination: Path, expected_sha256: Optional[str]) -
                 total = 0
             written = 0
             while True:
+                if heartbeat is not None:
+                    heartbeat()
                 chunk = response.read(CHUNK_SIZE)
                 if not chunk:
                     break
@@ -1340,14 +1362,19 @@ def download_file(url: str, destination: Path, expected_sha256: Optional[str]) -
                 temporary.unlink()
 
 
-def resolve_image(image: Optional[str], sha256: Optional[str], download_dir: Path) -> ImageSpec:
+def resolve_image(
+    image: Optional[str],
+    sha256: Optional[str],
+    download_dir: Path,
+    heartbeat: Optional[Callable[[], None]] = None,
+) -> ImageSpec:
     if image and urllib.parse.urlparse(image).scheme not in ("http", "https"):
         path = Path(image).expanduser().resolve()
         if not path.is_file():
             raise BurnError("Image not found: {}".format(path))
         if not (path.name.endswith(".img") or path.name.endswith(".img.xz")):
             raise BurnError("Only .img and .img.xz images are supported")
-        if sha256 and sha256_file(path) != sha256.lower():
+        if sha256 and sha256_file(path, heartbeat=heartbeat) != sha256.lower():
             raise BurnError("The local image SHA-256 does not match --sha256")
         return ImageSpec(path, sha256.lower() if sha256 else None, str(path))
 
@@ -1360,7 +1387,7 @@ def resolve_image(image: Optional[str], sha256: Optional[str], download_dir: Pat
         if expected is None:
             raise BurnError("--sha256 is required for an image from a custom URL")
     else:
-        url, filename, expected = find_latest_release_image()
+        url, filename, expected = find_latest_release_image(heartbeat=heartbeat)
 
     if not (filename.endswith(".img") or filename.endswith(".img.xz")):
         raise BurnError("Only .img and .img.xz images are supported")
@@ -1368,7 +1395,7 @@ def resolve_image(image: Optional[str], sha256: Optional[str], download_dir: Pat
     # Remote images live only in the TemporaryDirectory owned by main().
     # The directory is removed after the run, including on errors or Ctrl+C.
     destination = download_dir.resolve() / filename
-    download_file(url, destination, expected)
+    download_file(url, destination, expected, heartbeat=heartbeat)
     return ImageSpec(destination, expected, url)
 
 
@@ -1625,7 +1652,10 @@ def image_file_identity(path: Path) -> Tuple[int, int, int, int]:
 
 
 @contextlib.contextmanager
-def verified_source_stream(image: ImageSpec) -> Iterator[Any]:
+def verified_source_stream(
+    image: ImageSpec,
+    heartbeat: Optional[Callable[[], None]] = None,
+) -> Iterator[Any]:
     try:
         raw = image.path.open("rb")
     except OSError as exc:
@@ -1637,6 +1667,8 @@ def verified_source_stream(image: ImageSpec) -> Iterator[Any]:
         if image.compressed_sha256:
             digest = hashlib.sha256()
             while True:
+                if heartbeat is not None:
+                    heartbeat()
                 chunk = raw.read(CHUNK_SIZE)
                 if not chunk:
                     break
@@ -1661,7 +1693,10 @@ def verified_source_stream(image: ImageSpec) -> Iterator[Any]:
                 raise BurnError("The image file changed while it was being read")
 
 
-def inspect_image_file(path: Path) -> Tuple[int, Tuple[int, int, int, int]]:
+def inspect_image_file(
+    path: Path,
+    heartbeat: Optional[Callable[[], None]] = None,
+) -> Tuple[int, Tuple[int, int, int, int]]:
     try:
         raw = path.open("rb")
     except OSError as exc:
@@ -1669,6 +1704,8 @@ def inspect_image_file(path: Path) -> Tuple[int, Tuple[int, int, int, int]]:
     with raw:
         initial_identity = stat_identity(os.fstat(raw.fileno()))
         if path.name.endswith(".img"):
+            if heartbeat is not None:
+                heartbeat()
             size = initial_identity[2]
             if size <= 0:
                 raise BurnError("The image is empty")
@@ -1679,6 +1716,8 @@ def inspect_image_file(path: Path) -> Tuple[int, Tuple[int, int, int, int]]:
         try:
             with lzma.LZMAFile(raw, "rb") as source:
                 while True:
+                    if heartbeat is not None:
+                        heartbeat()
                     chunk = source.read(CHUNK_SIZE)
                     if not chunk:
                         break
@@ -1692,8 +1731,11 @@ def inspect_image_file(path: Path) -> Tuple[int, Tuple[int, int, int, int]]:
         return total, initial_identity
 
 
-def uncompressed_image_size(path: Path) -> int:
-    return inspect_image_file(path)[0]
+def uncompressed_image_size(
+    path: Path,
+    heartbeat: Optional[Callable[[], None]] = None,
+) -> int:
+    return inspect_image_file(path, heartbeat=heartbeat)[0]
 
 
 def terminate_process_group(process: subprocess.Popen[bytes]) -> None:
@@ -1869,7 +1911,7 @@ def verify_written_image(
     mismatch_actual = b""
     started = time.monotonic()
     try:
-        with verified_source_stream(image) as source:
+        with verified_source_stream(image, heartbeat=sudo_session.keep_alive) as source:
             unmount_disk(disk, heartbeat=sudo_session.keep_alive)
             ensure_same_disk(disk)
             process = popen_or_error(
@@ -1993,7 +2035,7 @@ def verify_written_image(
 def write_image(disk: Disk, image: ImageSpec, sudo_session: SudoSession) -> Tuple[str, int]:
     image_size = image.uncompressed_size
     if image_size is None:
-        image_size, identity = inspect_image_file(image.path)
+        image_size, identity = inspect_image_file(image.path, heartbeat=sudo_session.keep_alive)
         image = dataclasses.replace(image, uncompressed_size=image_size, file_identity=identity)
     if image_size <= 0:
         raise BurnError("The decompressed image is empty")
@@ -2004,7 +2046,7 @@ def write_image(disk: Disk, image: ImageSpec, sudo_session: SudoSession) -> Tupl
             )
         )
     if image.file_identity is None:
-        measured_size, identity = inspect_image_file(image.path)
+        measured_size, identity = inspect_image_file(image.path, heartbeat=sudo_session.keep_alive)
         if measured_size != image_size:
             raise BurnError("The image size changed after preflight verification")
         image = dataclasses.replace(image, file_identity=identity)
@@ -2013,7 +2055,7 @@ def write_image(disk: Disk, image: ImageSpec, sudo_session: SudoSession) -> Tupl
     written = 0
     started = time.monotonic()
     try:
-        with verified_source_stream(image) as source:
+        with verified_source_stream(image, heartbeat=sudo_session.keep_alive) as source:
             # The source has been opened and re-verified before the first
             # destructive operation, closing the common replace-after-check race.
             unmount_disk(disk, heartbeat=sudo_session.keep_alive)
@@ -2548,20 +2590,28 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         current_disk = None  # type: Optional[Disk]
         last_selected_disk = None  # type: Optional[Disk]
         try:
+            sudo_session = ensure_sudo()
             print("Finding and verifying the latest stable Ubuntu Server image for Raspberry Pi...")
-            image = resolve_image(args.image, args.sha256, Path(temporary_directory))
+            image = resolve_image(
+                args.image,
+                args.sha256,
+                Path(temporary_directory),
+                heartbeat=sudo_session.keep_alive,
+            )
             print("Image: {}".format(image.source))
             image_size = image.uncompressed_size
             if image_size is None:
                 print("Verifying the decompressed image before card selection...")
-                image_size, identity = inspect_image_file(image.path)
+                image_size, identity = inspect_image_file(
+                    image.path,
+                    heartbeat=sudo_session.keep_alive,
+                )
                 image = dataclasses.replace(
                     image,
                     uncompressed_size=image_size,
                     file_identity=identity,
                 )
             print("Decompressed image size: {}".format(human_size(image_size)))
-            sudo_session = ensure_sudo()
 
             for card_number in range(1, count + 1):
                 hostname = hostname_for(prefix, start_number + card_number - 1)
