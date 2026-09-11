@@ -322,7 +322,8 @@ def test_latest_release_skips_unpublished_development_version():
         burn.RELEASES_URL + "26.04/release/SHA256SUMS": (("b" * 64) + " *" + image_name).encode(),
     }
 
-    def fake_fetch(url):
+    def fake_fetch(url, heartbeat=None):
+        assert heartbeat is None
         if url.endswith("26.10/release/SHA256SUMS"):
             raise burn.FetchError("not released", status=404)
         return responses[url]
@@ -340,7 +341,8 @@ def test_latest_release_skips_unpublished_development_version():
 def test_latest_release_does_not_hide_network_failure():
     original_fetch = burn.fetch_bytes
 
-    def fake_fetch(url):
+    def fake_fetch(url, heartbeat=None):
+        assert heartbeat is None
         if url == burn.RELEASES_URL:
             return b'<a href="26.04/">26.04</a>'
         raise burn.FetchError("timeout")
@@ -1215,7 +1217,7 @@ def test_oversized_image_is_rejected_before_disk_operations(tmp_path):
 
 
 def test_changed_image_size_is_rejected_before_disk_operations(tmp_path):
-    """Reject a local image whose size differs from preflight before sudo or card operations."""
+    """Reject a local image whose size differs from preflight before card operations."""
 
     path = tmp_path / "ubuntu.img"
     path.write_bytes(b"changed")
@@ -1230,7 +1232,7 @@ def test_changed_image_size_is_rejected_before_disk_operations(tmp_path):
     assert type(raised.value) is burn.BurnError
     assert str(raised.value) == expected_error_message
     sudo_session.authenticate.assert_not_called()
-    sudo_session.keep_alive.assert_not_called()
+    sudo_session.keep_alive.assert_called_once_with()
     ensure_same_disk.assert_not_called()
     unmount.assert_not_called()
     popen.assert_not_called()
@@ -2130,10 +2132,10 @@ def test_long_transfer_preserves_safety_and_heartbeat_contract(operation):
         assert process.stdout.tell() == len(data)
 
     if operation == "image-write":
-        source_stream.assert_called_once_with(image)
+        source_stream.assert_called_once_with(image, heartbeat=sudo_session.keep_alive)
         assert transfer_result == (burn.hashlib.sha256(data).hexdigest(), len(data))
     elif operation == "image-read":
-        source_stream.assert_called_once_with(image)
+        source_stream.assert_called_once_with(image, heartbeat=sudo_session.keep_alive)
         assert transfer_result is None
     else:
         source_stream.assert_not_called()
@@ -3100,7 +3102,7 @@ def test_transfer_terminates_dd_after_control_plane_failure_or_cancellation(
     else:
         assert process.stdout.tell() == 4
     if operation.startswith("image-"):
-        source_stream.assert_called_once_with(image)
+        source_stream.assert_called_once_with(image, heartbeat=sudo_session.keep_alive)
     else:
         source_stream.assert_not_called()
 
@@ -3410,7 +3412,7 @@ def test_transfer_initial_heartbeat_stops_before_fingerprint_diskutil_or_dd(oper
         unmount.assert_called_once_with(disk, heartbeat=sudo_session.keep_alive)
     popen.assert_not_called()
     if operation.startswith("image-"):
-        source_stream.assert_called_once_with(image)
+        source_stream.assert_called_once_with(image, heartbeat=sudo_session.keep_alive)
     else:
         source_stream.assert_not_called()
 
@@ -4013,13 +4015,14 @@ def test_main_does_not_duplicate_local_image_on_failure(tmp_path, capsys, monkey
     image_path = tmp_path / "ubuntu.img"
     image_path.write_bytes(b"local image")
     diagnostics = tmp_path / "diagnostics"
-    primary_error = burn.SudoError("authorization failed")
+    primary_error = burn.BurnError("card selection failed")
+    sudo_session = mock.Mock(spec=burn.SudoSession)
     monkeypatch.setenv("WIFI", "secret")
     with mock.patch.object(
         burn, "find_ssh_public_key", return_value=("ssh-ed25519 AAAA test", None)
-    ), mock.patch.object(burn, "ensure_sudo", side_effect=primary_error), pytest.raises(
-        burn.SudoError
-    ) as raised:
+    ), mock.patch.object(burn, "ensure_sudo", return_value=sudo_session), mock.patch.object(
+        burn, "wait_for_disk", side_effect=primary_error
+    ), pytest.raises(burn.BurnError) as raised:
         burn.main(
             [
                 "--non-interactive",
@@ -4091,7 +4094,8 @@ def test_main_removes_temporary_image_when_no_failure_artifacts_are_preserved(
     sudo_session = mock.Mock(spec=burn.SudoSession)
     downloaded_paths = []
 
-    def resolve_remote(_image, _sha256, download_directory):
+    def resolve_remote(_image, _sha256, download_directory, heartbeat=None):
+        assert heartbeat is sudo_session.keep_alive
         path = download_directory / "ubuntu.img.xz"
         path.write_bytes(b"temporary image")
         downloaded_paths.append(path)
@@ -4177,7 +4181,8 @@ def test_main_preserves_remote_image_and_secret_free_report_after_inventory_fail
     sudo_session = mock.Mock(spec=burn.SudoSession)
     diagnostics = tmp_path / "diagnostics"
 
-    def resolve_remote(_image, _sha256, download_directory):
+    def resolve_remote(_image, _sha256, download_directory, heartbeat=None):
+        assert heartbeat is sudo_session.keep_alive
         path = download_directory / "ubuntu.img.xz"
         path.write_bytes(b"temporary image")
         return burn.ImageSpec(
@@ -4266,17 +4271,20 @@ def test_artifact_preservation_failure_does_not_mask_primary_error(
     """Warn about artifact failure while propagating the original run error unchanged."""
 
     image = burn.ImageSpec(Path("ubuntu.img.xz"), "a" * 64, "https://example.com/ubuntu.img.xz", 1024)
-    primary_error = burn.SudoError("authorization failed")
+    primary_error = burn.BurnError("card selection failed")
+    sudo_session = mock.Mock(spec=burn.SudoSession)
     monkeypatch.setenv("WIFI", "secret")
     with mock.patch.object(
         burn, "find_ssh_public_key", return_value=("ssh-ed25519 AAAA test", None)
     ), mock.patch.object(burn, "resolve_image", return_value=image), mock.patch.object(
-        burn, "ensure_sudo", side_effect=primary_error
+        burn, "ensure_sudo", return_value=sudo_session
+    ), mock.patch.object(
+        burn, "wait_for_disk", side_effect=primary_error
     ), mock.patch.object(
         burn,
         "preserve_failure_artifacts",
         side_effect=preservation_error,
-    ) as preserve_artifacts, pytest.raises(burn.SudoError) as raised:
+    ) as preserve_artifacts, pytest.raises(burn.BurnError) as raised:
         burn.main(
             [
                 "--non-interactive",
@@ -4311,9 +4319,11 @@ def test_artifact_staging_failure_does_not_mask_primary_error(tmp_path, capsys, 
     blocked_destination = tmp_path / "not-a-directory"
     blocked_destination.write_text("file")
     downloaded_paths = []
-    primary_error = burn.SudoError("authorization failed")
+    primary_error = burn.BurnError("card selection failed")
+    sudo_session = mock.Mock(spec=burn.SudoSession)
 
-    def resolve_remote(_image, _sha256, download_directory):
+    def resolve_remote(_image, _sha256, download_directory, heartbeat=None):
+        assert heartbeat is sudo_session.keep_alive
         path = download_directory / "ubuntu.img.xz"
         path.write_bytes(b"temporary image")
         downloaded_paths.append(path)
@@ -4328,9 +4338,11 @@ def test_artifact_staging_failure_does_not_mask_primary_error(tmp_path, capsys, 
     with mock.patch.object(
         burn, "find_ssh_public_key", return_value=("ssh-ed25519 AAAA test", None)
     ), mock.patch.object(burn, "resolve_image", side_effect=resolve_remote), mock.patch.object(
-        burn, "ensure_sudo", side_effect=primary_error
+        burn, "ensure_sudo", return_value=sudo_session
+    ), mock.patch.object(
+        burn, "wait_for_disk", side_effect=primary_error
     ), mock.patch.object(burn, "preserve_failure_artifacts") as preserve_artifacts, pytest.raises(
-        burn.SudoError
+        burn.BurnError
     ) as raised:
         burn.main(
             [
@@ -4451,7 +4463,8 @@ def test_noninteractive_flow_recovers_from_forced_sleep_and_reuses_card_reader(
     monkeypatch.setenv("WIFI", "secret")
     write_attempt_number = 0
 
-    def fake_resolve(_image, _sha256, download_dir):
+    def fake_resolve(_image, _sha256, download_dir, heartbeat=None):
+        assert heartbeat is sudo_session.keep_alive
         path = download_dir / "ubuntu.img.xz"
         path.write_bytes(b"temporary image")
         downloaded_paths.append(path)

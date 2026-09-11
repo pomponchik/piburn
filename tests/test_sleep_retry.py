@@ -47,7 +47,9 @@ def main_rig(monkeypatch):
     sudo_session.keep_alive.side_effect = lambda: events.append("heartbeat")
     rig = SimpleNamespace(events=events, disk=disk, image=image, sudo_session=sudo_session)
 
-    rig.resolve_image = mock.Mock(side_effect=lambda *_args: events.append("download") or image)
+    rig.resolve_image = mock.Mock(
+        side_effect=lambda *_args, **_kwargs: events.append("download") or image
+    )
     rig.ensure_sudo = mock.Mock(return_value=sudo_session)
     rig.wait_for_disk = mock.Mock(side_effect=lambda *_args, **_kwargs: events.append("selection") or disk)
     rig.wait_for_same_disk = mock.Mock(side_effect=lambda *_args, **_kwargs: events.append("recovery-wait") or disk)
