@@ -64,7 +64,7 @@ Insert a microSD card and run:
 piburn
 ```
 
-The interactive interface first asks how many cards to prepare and whether to run the full integrity test, then collects the Wi-Fi, hostname, and login settings. For each card, it asks you to select the target device. The starting hostname number defaults to `1`. Cards are prepared one at a time, so a single card reader is enough.
+The interactive interface first asks how many cards to prepare and whether to run the full integrity test, then collects the Wi-Fi, hostname, and login settings. After those initial questions, it requests administrator authentication before downloading and verifying the image, and keeps that authorization active while it works. For each card, it asks you to select the target device. The starting hostname number defaults to `1`. Cards are prepared one at a time, so a single card reader is enough.
 
 Press `Ctrl+C` at any step to stop. The display may turn off and the screen may lock while a card is being prepared; neither interrupts the operation.
 
@@ -137,7 +137,7 @@ Before retrying, `piburn` waits for the original card on its original `/dev/disk
 
 ## Non-interactive usage
 
-`--non-interactive` disables `piburn`'s own prompts, but `sudo` may still request administrator authentication once at the start. `piburn` keeps that authorization active during long writes and checks; macOS may ask again only if the authorization is revoked or the system uses an unusually short timeout. Passwords are read from environment variables rather than command-line arguments. Replace `wifi-password`, `MyNetwork`, and the sample device paths with your own values; `--yes` authorizes writing to those devices without confirmation.
+`--non-interactive` disables `piburn`'s own prompts, but `sudo` may still request administrator authentication once before image preparation starts. `piburn` keeps that authorization active during image download and verification as well as long card writes and checks; macOS may ask again only if the authorization is revoked or the system uses an unusually short timeout. Passwords are read from environment variables rather than command-line arguments. Replace `wifi-password`, `MyNetwork`, and the sample device paths with your own values; `--yes` authorizes writing to those devices without confirmation.
 
 ```bash
 export PIBURN_WIFI_PASSWORD='wifi-password'
