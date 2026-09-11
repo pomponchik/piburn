@@ -355,6 +355,99 @@ def test_latest_release_does_not_hide_network_failure():
         burn.fetch_bytes = original_fetch
 
 
+def test_latest_release_forwards_heartbeat_to_metadata_downloads():
+    """Keep sudo alive while fetching both the release index and checksum manifest."""
+
+    heartbeat = mock.Mock()
+    image_name = "ubuntu-26.04-preinstalled-server-arm64+raspi.img.xz"
+    responses = {
+        burn.RELEASES_URL: b'<a href="26.04/">26.04</a>',
+        burn.RELEASES_URL + "26.04/release/SHA256SUMS": (
+            ("b" * 64) + " *" + image_name
+        ).encode(),
+    }
+
+    with mock.patch.object(burn, "fetch_bytes", side_effect=lambda url, **_kwargs: responses[url]) as fetch:
+        burn.find_latest_release_image(heartbeat=heartbeat)
+
+    assert fetch.call_args_list == [
+        mock.call(burn.RELEASES_URL, heartbeat=heartbeat),
+        mock.call(
+            burn.RELEASES_URL + "26.04/release/SHA256SUMS",
+            heartbeat=heartbeat,
+        ),
+    ]
+
+
+def test_fetch_bytes_calls_heartbeat_around_every_network_read():
+    """Refresh sudo throughout small metadata downloads, including the final EOF read."""
+
+    response = mock.MagicMock()
+    response.__enter__.return_value = response
+    response.read.side_effect = [b"first", b"second", b""]
+    heartbeat = mock.Mock()
+
+    with mock.patch.object(burn.urllib.request, "urlopen", return_value=response):
+        assert burn.fetch_bytes("https://example.invalid/metadata", heartbeat=heartbeat) == b"firstsecond"
+
+    assert heartbeat.call_args_list == [mock.call(), mock.call(), mock.call()]
+
+
+def test_image_download_and_local_hash_call_heartbeat_for_every_chunk(tmp_path):
+    """Refresh sudo continuously during both remote downloads and local checksum reads."""
+
+    response = mock.MagicMock()
+    response.__enter__.return_value = response
+    response.headers = {"Content-Length": "6"}
+    response.read.side_effect = [b"abc", b"def", b""]
+    heartbeat = mock.Mock()
+    destination = tmp_path / "ubuntu.img.xz"
+
+    with mock.patch.object(burn.urllib.request, "urlopen", return_value=response), mock.patch.object(
+        burn, "show_progress"
+    ):
+        burn.download_file(
+            "https://example.invalid/ubuntu.img.xz",
+            destination,
+            burn.hashlib.sha256(b"abcdef").hexdigest(),
+            heartbeat=heartbeat,
+        )
+
+    assert destination.read_bytes() == b"abcdef"
+    assert heartbeat.call_args_list == [mock.call(), mock.call(), mock.call()]
+
+    heartbeat.reset_mock()
+    with mock.patch.object(burn, "CHUNK_SIZE", 2):
+        assert burn.sha256_file(destination, heartbeat=heartbeat) == burn.hashlib.sha256(b"abcdef").hexdigest()
+    assert heartbeat.call_args_list == [mock.call()] * 4
+
+
+def test_resolve_image_forwards_heartbeat_to_local_and_remote_preparation(tmp_path):
+    """Connect the main image resolver's heartbeat to either source path."""
+
+    heartbeat = mock.Mock()
+    local_path = tmp_path / "local.img"
+    local_path.write_bytes(b"image")
+    digest = burn.hashlib.sha256(b"image").hexdigest()
+    with mock.patch.object(burn, "sha256_file", return_value=digest) as sha256_file:
+        burn.resolve_image(str(local_path), digest, tmp_path, heartbeat=heartbeat)
+    sha256_file.assert_called_once_with(local_path, heartbeat=heartbeat)
+
+    remote_name = "ubuntu-26.04-preinstalled-server-arm64+raspi.img.xz"
+    remote_url = "https://example.invalid/" + remote_name
+    with mock.patch.object(
+        burn, "find_latest_release_image", return_value=(remote_url, remote_name, digest)
+    ) as find_latest, mock.patch.object(burn, "download_file") as download:
+        burn.resolve_image(None, None, tmp_path, heartbeat=heartbeat)
+    find_latest.assert_called_once_with(heartbeat=heartbeat)
+    download.assert_called_once_with(
+        remote_url,
+        tmp_path.resolve() / remote_name,
+        digest,
+        heartbeat=heartbeat,
+    )
+
+
 @pytest.mark.parametrize(
     "unsafe_override",
     [
@@ -2297,7 +2390,8 @@ def test_verify_written_image_reopens_and_revalidates_source(tmp_path):
 
     assert verification_result is None
     assert process.stdout.tell() == len(data)
-    sudo_session.keep_alive.assert_not_called()
+    expected_checksum_heartbeats = (len(compressed_data) + 3) // 4 + 1
+    assert sudo_session.keep_alive.call_args_list == [mock.call()] * expected_checksum_heartbeats
     ensure_same_disk.assert_not_called()
     unmount.assert_not_called()
     popen.assert_not_called()
@@ -3837,6 +3931,22 @@ def test_truncated_xz_is_reported_as_burn_error():
             burn.uncompressed_image_size(path)
 
 
+def test_image_inspection_calls_heartbeat_while_decompressing(tmp_path):
+    """Keep sudo alive throughout the decompressed-size preflight pass."""
+
+    data = b"abcdefghij"
+    path = tmp_path / "ubuntu.img.xz"
+    path.write_bytes(lzma.compress(data))
+    heartbeat = mock.Mock()
+
+    with mock.patch.object(burn, "CHUNK_SIZE", 4):
+        size, identity = burn.inspect_image_file(path, heartbeat=heartbeat)
+
+    assert size == len(data)
+    assert identity == burn.image_file_identity(path)
+    assert heartbeat.call_args_list == [mock.call()] * 4
+
+
 def test_inventory_write_error_is_user_facing():
     with tempfile.TemporaryDirectory() as directory, mock.patch.object(
         burn.Path, "mkdir", side_effect=PermissionError("denied")
@@ -4382,21 +4492,40 @@ def test_start_number_must_be_positive(value):
 
 
 def test_interactive_start_number_prompt_follows_prefix_and_defaults_to_one(monkeypatch, card_operation_events):
-    """Prompt for the prefix first, retry the start number, and default it to one."""
+    """Finish configuration prompts before sudo, then resolve the image with its heartbeat."""
 
     disk = burn.Disk("disk4", "SD Card", 32 * 1024**3, "USB", False, True, True)
     image = burn.ImageSpec(Path("ubuntu.img"), None, "test image", uncompressed_size=1024)
     sudo_session = mock.Mock(spec=burn.SudoSession)
+    events = []
+    answers = iter(["node", "invalid", ""])
     monkeypatch.setenv("WIFI", "secret")
 
+    def answer(prompt):
+        events.append(prompt)
+        return next(answers)
+
+    def find_key(*_args):
+        events.append("ssh-key")
+        return "ssh-ed25519 AAAA test", None
+
+    def authorize():
+        events.append("sudo")
+        return sudo_session
+
+    def resolve(*_args, heartbeat=None):
+        assert heartbeat is sudo_session.keep_alive
+        events.append("image")
+        return image
+
     with mock.patch.object(
-        burn, "input", side_effect=["node", "invalid", ""]
+        burn, "input", side_effect=answer
     ) as input_mock, mock.patch.object(
-        burn, "find_ssh_public_key", return_value=("ssh-ed25519 AAAA test", None)
+        burn, "find_ssh_public_key", side_effect=find_key
     ), mock.patch.object(
-        burn, "resolve_image", return_value=image
+        burn, "resolve_image", side_effect=resolve
     ), mock.patch.object(
-        burn, "ensure_sudo", return_value=sudo_session
+        burn, "ensure_sudo", side_effect=authorize
     ), mock.patch.object(
         burn, "get_disk", return_value=disk
     ), mock.patch.object(
@@ -4430,8 +4559,54 @@ def test_interactive_start_number_prompt_follows_prefix_and_defaults_to_one(monk
         mock.call("Starting hostname number [1]: "),
         mock.call("Starting hostname number [1]: "),
     ]
+    assert events == [
+        "Hostname prefix [pi]: ",
+        "Starting hostname number [1]: ",
+        "Starting hostname number [1]: ",
+        "ssh-key",
+        "sudo",
+        "image",
+    ]
     assert cloud_init.call_args.args[1] == "node-1"
     sudo_session.authenticate.assert_not_called()
+
+
+def test_main_sudo_failure_prevents_image_preparation(monkeypatch):
+    """Fail immediately after configuration instead of downloading an image first."""
+
+    authorization_error = burn.SudoError("authorization failed")
+    monkeypatch.setenv("WIFI", "secret")
+    with mock.patch.object(
+        burn, "find_ssh_public_key", return_value=("ssh-ed25519 AAAA test", None)
+    ), mock.patch.object(
+        burn, "ensure_sudo", side_effect=authorization_error
+    ) as ensure_sudo, mock.patch.object(burn, "resolve_image") as resolve_image, pytest.raises(
+        burn.SudoError
+    ) as raised:
+        burn.main(
+            [
+                "--non-interactive",
+                "--count",
+                "1",
+                "--no-check",
+                "--ssid",
+                "wifi",
+                "--wifi-password-env",
+                "WIFI",
+                "--prefix",
+                "pi",
+                "--auth-mode",
+                "ssh-key",
+                "--device",
+                "/dev/disk4",
+                "--no-inventory",
+                "--yes",
+            ]
+        )
+
+    assert raised.value is authorization_error
+    ensure_sudo.assert_called_once_with()
+    resolve_image.assert_not_called()
 
 
 @pytest.mark.parametrize("check_cards", [False, True], ids=["unchecked", "checked"])
