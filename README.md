@@ -64,7 +64,7 @@ Insert a microSD card and run:
 piburn
 ```
 
-The interactive interface first asks how many cards to prepare and whether to run the full integrity test, then collects the Wi-Fi, hostname, and login settings. After those initial questions, it requests administrator authentication before downloading and verifying the image, and keeps that authorization active while it works. For each card, it asks you to select the target device. The starting hostname number defaults to `1`. Cards are prepared one at a time, so a single card reader is enough.
+The interactive interface first asks how many cards to prepare and whether to run the full integrity test, then collects the Wi-Fi, hostname, and login settings. After those initial questions, it requests administrator authentication and asks you to select the first target card before downloading and verifying the image. The selected card is checked again before any destructive operation. For additional cards, target selection happens after the previous card is finished. The starting hostname number defaults to `1`. Cards are prepared one at a time, so a single card reader is enough.
 
 Press `Ctrl+C` at any step to stop. The display may turn off and the screen may lock while a card is being prepared; neither interrupts the operation.
 
