@@ -47,7 +47,9 @@ def main_rig(monkeypatch):
     sudo_session.keep_alive.side_effect = lambda: events.append("heartbeat")
     rig = SimpleNamespace(events=events, disk=disk, image=image, sudo_session=sudo_session)
 
-    rig.resolve_image = mock.Mock(side_effect=lambda *_args: events.append("download") or image)
+    rig.resolve_image = mock.Mock(
+        side_effect=lambda *_args, **_kwargs: events.append("download") or image
+    )
     rig.ensure_sudo = mock.Mock(return_value=sudo_session)
     rig.wait_for_disk = mock.Mock(side_effect=lambda *_args, **_kwargs: events.append("selection") or disk)
     rig.wait_for_same_disk = mock.Mock(side_effect=lambda *_args, **_kwargs: events.append("recovery-wait") or disk)
@@ -139,7 +141,7 @@ def main_rig(monkeypatch):
 
 @pytest.mark.parametrize("check", [False, True], ids=["unchecked", "checked"])
 def test_main_holds_power_guard_for_exact_card_critical_section(main_rig, check):
-    """Start the guard after image resolution and card selection, and keep it through commit.
+    """Select first, resolve the image, then guard the exact card-critical section through commit.
 
     The optional integrity check runs inside it; inventory creation remains
     outside after eject and commit.
@@ -161,8 +163,8 @@ def test_main_holds_power_guard_for_exact_card_critical_section(main_rig, check)
         ]
     )
     assert main_rig.events == [
-        "download",
         "selection",
+        "download",
         "power-enter",
         *protected_events,
         "power-exit",
@@ -562,7 +564,7 @@ def test_main_restarts_image_from_zero_after_sleep_in_any_late_stage(main_rig, s
     ]
     assert (
         main_rig.events
-        == ["download", "selection"]
+        == ["selection", "download"]
         + expected_first_attempt_events
         + expected_successful_attempt_events
     )
@@ -810,8 +812,8 @@ def test_main_final_fingerprint_failure_prevents_regular_eject_and_commit(main_r
 
     assert raised.value is fingerprint_error
     assert main_rig.events == [
-        "download",
         "selection",
+        "download",
         "power-enter",
         ("mount-enter", "disk4"),
         "write",
